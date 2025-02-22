@@ -17,3 +17,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
     chrome.tabs.executeScript({ file: "content.js" });
 });
+
+
+document.getElementById("downloadAll").addEventListener("click", () => {
+    // force press all download buttons
+    let downloadButtons = document.querySelectorAll("button");
+    downloadButtons.forEach(button => button.click());
+});
