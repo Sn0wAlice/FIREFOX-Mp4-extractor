@@ -1,5 +1,9 @@
 // content.js
 (() => {
+    get_all_file();
+})();
+
+function get_all_file() {
     let links = new Set();
 
     // Extract from <a> elements
@@ -7,7 +11,7 @@
         links.add({
             url: a.href,
             domain: new URL(a.href).hostname,
-            filename: a.href.split('/').pop().split('?')[0]
+            filename: get_pretty_filename(a.href)
         });
     });
 
@@ -21,21 +25,33 @@
             links.add({
                 url: video.src,
                 domain: new URL(video.src).hostname,
-                filename: video.src.split('/').pop().split('?')[0]
+                filename: get_pretty_filename(video.src)
             });
         }
     });
 
-    // Extract from <source> elements
-    document.querySelectorAll("source[src$='.mp4']").forEach(source => {
-        links.add({
-            url: source.src,
-            domain: new URL(source.src).hostname,
-            filename: source.src.split('/').pop().split('?')[0]
-        });
+
+    document.querySelectorAll("source").forEach(s => {
+        if(s.src) {
+            links.add({
+                url: s.src,
+                domain: new URL(s.src).hostname,
+                filename: get_pretty_filename(s.src)
+            });
+        }
     });
 
     // Log all found mp4 links to console
     console.log("Found MP4 files:", Array.from(links));
     browser.runtime.sendMessage({ action: "mp4_links", links: Array.from(links) });
-})();
+}
+
+function get_pretty_filename(s) {
+    let name = s.split('?')[0].split('/')
+
+    while(name[name.length - 1] === '') {
+        name.pop()
+    }
+
+    return name[name.length - 1]
+}
