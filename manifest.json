@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "MP4 Extractor",
-  "version": "1.0",
+  "version": "1.1",
   "description": "Extracts all .mp4 files from a webpage.",
   "permissions": ["activeTab", "downloads"],
   "browser_action": {
