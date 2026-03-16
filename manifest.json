@@ -1,19 +1,45 @@
 {
   "manifest_version": 2,
-  "name": "MP4 Extractor",
-  "version": "1.1",
-  "description": "Extracts all .mp4 files from a webpage.",
-  "permissions": ["activeTab", "downloads"],
+  "name": "Media Extractor Pro",
+  "version": "4.0",
+  "description": "The ultimate media extraction toolkit for Firefox. Detect, preview, and download videos, audio, and HLS/DASH streams from any webpage. Smart deduplication, download queue, hover preview, resolution & duration display, source tracking, batch rename, watch mode, size filter, quality grouping, best-quality download, TS-to-MP4 transmuxing, dark/light theme, blacklist, and export.",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "64": "icons/icon-64.png",
+    "128": "icons/icon-128.png"
+  },
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "webRequest",
+    "storage",
+    "clipboardWrite",
+    "tabs",
+    "<all_urls>"
+  ],
   "browser_action": {
     "default_popup": "popup.html",
-    "default_icon": "icon.png"
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "64": "icons/icon-64.png"
+    }
   },
   "background": {
-    "scripts": ["background.js"],
+    "scripts": ["lib/mux-shim.js", "background.js"],
     "persistent": false
   },
   "content_scripts": [{
     "matches": ["<all_urls>"],
-    "js": ["content.js"]
-  }]
+    "js": ["content.js"],
+    "run_at": "document_idle",
+    "all_frames": true
+  }],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
+  }
 }

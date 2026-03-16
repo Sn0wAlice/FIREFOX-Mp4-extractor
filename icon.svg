@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- Rounded square background -->
+  <rect x="4" y="4" width="120" height="120" rx="28" ry="28" fill="#7c3aed"/>
+  <!-- Subtle inner glow -->
+  <rect x="4" y="4" width="120" height="60" rx="28" ry="28" fill="#9333ea" opacity="0.4"/>
+  <!-- Play triangle (left side) -->
+  <polygon points="36,38 36,90 70,64" fill="white"/>
+  <!-- Download arrow shaft -->
+  <rect x="79" y="36" width="9" height="36" rx="4" fill="white"/>
+  <!-- Download arrow head -->
+  <polygon points="70,66 83.5,82 97,66" fill="white"/>
+  <!-- Download tray bar -->
+  <rect x="69" y="88" width="30" height="6" rx="3" fill="white" opacity="0.6"/>
+</svg>
