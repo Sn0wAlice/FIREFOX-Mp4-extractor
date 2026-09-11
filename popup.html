@@ -248,6 +248,61 @@
     .media-item:hover { background: var(--surface); }
     .media-item.is-duplicate { opacity: 0.55; }
 
+    /* ── Row-wide download progress ──
+       The whole row is the progress bar. The button only carries the state. */
+    .media-item,
+    .quality-group-header,
+    .quality-variant { position: relative; overflow: hidden; }
+
+    .media-item > *:not(.row-progress),
+    .quality-group-header > *:not(.row-progress),
+    .quality-variant > *:not(.row-progress) { position: relative; z-index: 1; }
+
+    .row-progress {
+      position: absolute;
+      left: 0; top: 0; bottom: 0;
+      width: 0;
+      background: var(--accent);
+      opacity: 0.3;
+      transition: width 0.3s ease, opacity 0.4s ease;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* A crisp leading edge makes the exact position readable; it is hidden
+       for the states whose width carries no meaning. */
+    .row-progress::after {
+      content: "";
+      position: absolute;
+      right: 0; top: 0; bottom: 0;
+      width: 2px;
+      background: var(--accent);
+      opacity: 0.85;
+    }
+
+    .is-queued .row-progress::after,
+    .is-muxing .row-progress::after,
+    .is-done .row-progress::after { display: none; }
+
+    /* Queued and remuxing have no measurable progress, so they breathe
+       across the full row instead of showing a misleading width. */
+    .is-queued .row-progress { width: 100%; animation: rowPulse 1.6s ease-in-out infinite; }
+    .is-muxing .row-progress { width: 100%; animation: rowPulse 0.9s ease-in-out infinite; }
+    .is-done .row-progress { width: 100%; background: var(--green); opacity: 0.22; }
+
+    @keyframes rowPulse { 0%, 100% { opacity: 0.08; } 50% { opacity: 0.3; } }
+
+    .progress-label {
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--accent);
+      white-space: nowrap;
+      letter-spacing: 0.2px;
+    }
+
+    .progress-label:empty { display: none; }
+    .is-done .progress-label { color: var(--green); }
+
     .media-thumb {
       width: 52px;
       height: 34px;
@@ -436,15 +491,6 @@
 
     .dl-btn.downloading { background: var(--surface2); cursor: default; pointer-events: none; }
     .dl-btn.queued { background: var(--surface2); cursor: default; opacity: 0.6; }
-
-    .dl-btn .progress-fill {
-      position: absolute;
-      left: 0; top: 0; height: 100%;
-      background: var(--accent);
-      opacity: 0.4;
-      transition: width 0.3s;
-      border-radius: 5px;
-    }
 
     .dl-btn .btn-text { position: relative; z-index: 1; font-size: 11px; }
     .dl-btn.done { background: var(--green); }

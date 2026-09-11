@@ -29,6 +29,8 @@ const tabTitles = {};
 const tabWatchMode = {};
 // Which tabs belong to a private browsing window
 const tabPrivate = {};
+// Page URL per tab, used as the Referer of our own media requests
+const tabPageUrl = {};
 // Download queue
 const downloadQueue = [];
 let activeDownloads = 0;
@@ -123,10 +125,85 @@ function startDownload(options, tabId) {
   );
 }
 
+// Most CDNs reject a segment request that does not carry the Referer of the
+// page playing the stream. fetch() refuses to set Referer or Origin, so they
+// are injected with a blocking listener scoped to our own background requests.
+const pendingRequestHeaders = new Map();
+
+browser.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    if (details.tabId !== -1) return;
+    const wanted = pendingRequestHeaders.get(details.url);
+    if (!wanted) return;
+
+    const headers = (details.requestHeaders || []).filter(
+      (h) => !/^(referer|origin)$/i.test(h.name)
+    );
+    headers.push({ name: "Referer", value: wanted.referer });
+    if (wanted.origin) headers.push({ name: "Origin", value: wanted.origin });
+    return { requestHeaders: headers };
+  },
+  { urls: ["<all_urls>"] },
+  ["blocking", "requestHeaders"]
+);
+
+// Everything the background page needs to reproduce a tab's request context.
+function tabContext(tabId) {
+  return { isPrivate: isPrivateTab(tabId), referer: tabPageUrl[tabId] || null };
+}
+
 // Requests made on behalf of a private tab are sent without credentials so the
 // normal-session cookie jar of the background page is never exposed to the CDN.
-function mediaFetch(url, isPrivate) {
-  return isPrivate ? fetch(url, { credentials: "omit" }) : fetch(url);
+async function mediaFetch(url, ctx, range) {
+  const referer = ctx && ctx.referer;
+  if (referer) {
+    const existing = pendingRequestHeaders.get(url);
+    if (existing) {
+      existing.count++;
+    } else {
+      let origin = null;
+      try { origin = new URL(referer).origin; } catch {}
+      pendingRequestHeaders.set(url, { referer, origin, count: 1 });
+    }
+  }
+
+  const init = {};
+  if (ctx && ctx.isPrivate) init.credentials = "omit";
+  if (range) init.headers = { Range: `bytes=${range.start}-${range.start + range.length - 1}` };
+
+  try {
+    return await fetch(url, init);
+  } finally {
+    if (referer) {
+      const entry = pendingRequestHeaders.get(url);
+      if (entry && --entry.count <= 0) pendingRequestHeaders.delete(url);
+    }
+  }
+}
+
+// ── Segments ──
+// A segment is { url, start?, length? }. #EXT-X-BYTERANGE playlists point every
+// segment at the same URL and distinguish them only by the slice they cover, so
+// a segment can never be reduced to its URL.
+
+function parseByteRange(value) {
+  const [lenPart, offsetPart] = value.trim().split("@");
+  const length = parseInt(lenPart, 10);
+  if (!Number.isFinite(length) || length <= 0) return null;
+  const offset = offsetPart === undefined ? null : parseInt(offsetPart, 10);
+  return { length, offset: Number.isFinite(offset) ? offset : null };
+}
+
+function segmentRange(segment) {
+  return typeof segment.start === "number" ? { start: segment.start, length: segment.length } : null;
+}
+
+// A server may ignore Range and answer 200 with the whole resource; slicing
+// here keeps that case from concatenating the full file once per segment.
+function sliceRangeResponse(buffer, status, range) {
+  if (!range || status === 206) return buffer;
+  if (buffer.byteLength <= range.start) return new ArrayBuffer(0);
+  return buffer.slice(range.start, range.start + range.length);
 }
 
 function resolveUrl(raw, baseUrl) {
@@ -375,9 +452,9 @@ function updateBadge(tabId) {
 
 // ── HLS/DASH parsing ──
 
-async function parseM3U8(url, isPrivate) {
+async function parseM3U8(url, ctx) {
   try {
-    const resp = await mediaFetch(url, isPrivate);
+    const resp = await mediaFetch(url, ctx);
     const text = await resp.text();
     const lines = text.split("\n").map((l) => l.trim());
     const result = { masterUrl: url, variants: [], segments: [], audioGroups: [], totalDuration: 0 };
@@ -424,15 +501,36 @@ async function parseM3U8(url, isPrivate) {
     } else {
       // Media playlist — also sum duration
       let duration = 0;
+      let pendingRange = null;
+      // #EXT-X-BYTERANGE may omit the offset, which then means "straight after
+      // the previous sub-range of the same resource".
+      const nextOffset = new Map();
+
       for (const line of lines) {
         if (line.startsWith("#EXTINF:")) {
           const dur = parseFloat(line.split(":")[1]);
           if (!isNaN(dur)) duration += dur;
+          continue;
         }
-        if (line && !line.startsWith("#")) {
-          const segUrl = resolveUrl(line, url);
-          if (segUrl) result.segments.push(segUrl);
+        if (line.startsWith("#EXT-X-BYTERANGE:")) {
+          pendingRange = parseByteRange(line.slice("#EXT-X-BYTERANGE:".length));
+          continue;
         }
+        if (!line || line.startsWith("#")) continue;
+
+        const segUrl = resolveUrl(line, url);
+        const range = pendingRange;
+        pendingRange = null;
+        if (!segUrl) continue;
+
+        const segment = { url: segUrl };
+        if (range) {
+          const start = range.offset === null ? (nextOffset.get(segUrl) || 0) : range.offset;
+          segment.start = start;
+          segment.length = range.length;
+          nextOffset.set(segUrl, start + range.length);
+        }
+        result.segments.push(segment);
       }
       result.totalDuration = duration;
     }
@@ -483,24 +581,28 @@ function transmuxTStoMP4(tsData) {
 
 // ── Unified download: uses captured segments first, manifest re-fetch as fallback ──
 
-async function downloadStream(tabId, url, filename, qualityHeight) {
-  const progressKey = url;
-  const isPrivate = isPrivateTab(tabId);
+// progressKey is the URL the popup shows for this item. It differs from the
+// manifest URL whenever a consolidated stream is downloaded through its
+// manifest, and reporting on the wrong key leaves the popup without a bar.
+async function downloadStream(tabId, url, filename, qualityHeight, progressKey = url) {
+  const ctx = tabContext(tabId);
 
   const capturedSegments = collectCapturedSegments(tabId, url);
 
   let manifest = null;
   if (/\.m3u8(\?|$)/i.test(url)) {
-    manifest = await getManifestSegments(url, qualityHeight, isPrivate);
+    manifest = await getManifestSegments(url, qualityHeight, ctx);
   }
 
   let segmentUrls = [];
   let audioSegmentUrls = [];
+  let playlistDuration = 0;
   let source = "";
 
   if (manifest && manifest.video.length > 0) {
     segmentUrls = manifest.video;
     audioSegmentUrls = manifest.audio;
+    playlistDuration = manifest.duration || 0;
     source = "manifest";
   } else if (capturedSegments.length > 0) {
     segmentUrls = capturedSegments;
@@ -508,9 +610,10 @@ async function downloadStream(tabId, url, filename, qualityHeight) {
   } else {
     const storedParsed = tabHLS[tabId] && tabHLS[tabId].get(url);
     if (storedParsed) {
-      const stored = await getSegmentsFromStoredManifest(storedParsed, qualityHeight, isPrivate);
+      const stored = await getSegmentsFromStoredManifest(storedParsed, qualityHeight, ctx);
       segmentUrls = stored.video;
       audioSegmentUrls = stored.audio;
+      playlistDuration = stored.duration || 0;
       source = "stored";
     }
   }
@@ -521,21 +624,20 @@ async function downloadStream(tabId, url, filename, qualityHeight) {
 
   reportProgress(progressKey, 1, `Found ${segmentUrls.length} segments (${source})`);
 
-  const chunks = await downloadSegmentsWithProgress(
-    segmentUrls, progressKey, 0, segmentUrls.length, isPrivate
+  const video = await downloadSegmentsWithProgress(
+    segmentUrls, progressKey, 0, segmentUrls.length, ctx
   );
 
-  if (chunks.length === 0) {
-    return { error: "All segment downloads failed" };
-  }
+  const incomplete = segmentFailureError(video, segmentUrls.length, ctx);
+  if (incomplete) return incomplete;
 
-  const result = await writeSegmentsAsVideo(chunks, filename, progressKey, tabId);
+  const result = await writeSegmentsAsVideo(video.chunks, filename, progressKey, tabId, playlistDuration);
   result.segments = segmentUrls.length;
 
   // A separate audio rendition cannot be muxed into the video stream here, so
   // it is written as its own file instead of being appended to the video.
   if (audioSegmentUrls.length > 0) {
-    const audio = await downloadAudioRendition(audioSegmentUrls, filename, progressKey, tabId);
+    const audio = await downloadAudioRendition(audioSegmentUrls, filename, progressKey, tabId, ctx);
     if (audio) {
       result.separateAudio = true;
       result.audioFilename = audio.filename;
@@ -545,9 +647,630 @@ async function downloadStream(tabId, url, filename, qualityHeight) {
   return result;
 }
 
+// A stream stitched from a partial segment list plays back broken, so a run
+// that lost segments fails loudly instead of writing a corrupt file.
+function segmentFailureError(result, total, ctx) {
+  if (result.chunks.length === 0) {
+    return {
+      error: ctx.referer
+        ? "Every segment request failed — the server refused them."
+        : "Every segment request failed. Reload the page so the extension sees it, then retry."
+    };
+  }
+  if (result.failed / total > 0.02) {
+    return { error: `${result.failed} of ${total} segments failed — output would be broken.` };
+  }
+  return null;
+}
+
+// ── Fragmented MP4 header repair ──
+// mux.js stamps 0xFFFFFFFF, the "unknown duration" value, into every duration
+// field of the init segment. Media Source Extensions does not care, which is
+// why the file plays in a browser, but desktop players read those fields and
+// show 13 or 24 hours and refuse to seek. Once every fragment has been
+// downloaded the real duration is known, so it is written back into the header.
+
+const UNKNOWN_DURATION = 0xffffffff;
+
+function readBoxes(view, start, end) {
+  const boxes = [];
+  let off = start;
+  while (off + 8 <= end) {
+    const size = view.getUint32(off);
+    if (size < 8 || off + size > end) break;
+    const type = String.fromCharCode(
+      view.getUint8(off + 4), view.getUint8(off + 5),
+      view.getUint8(off + 6), view.getUint8(off + 7)
+    );
+    boxes.push({ type, body: off + 8, end: off + size });
+    off += size;
+  }
+  return boxes;
+}
+
+function findBox(view, parent, type) {
+  return readBoxes(view, parent.body, parent.end).find((b) => b.type === type) || null;
+}
+
+// mvhd and mdhd share the layout of the two fields we care about.
+function headerFields(view, box) {
+  return view.getUint8(box.body) === 1
+    ? { timescaleAt: box.body + 20, durationAt: box.body + 24, wide: true }
+    : { timescaleAt: box.body + 12, durationAt: box.body + 16, wide: false };
+}
+
+function trackHeaderFields(view, box) {
+  return view.getUint8(box.body) === 1
+    ? { trackIdAt: box.body + 20, durationAt: box.body + 28, wide: true }
+    : { trackIdAt: box.body + 12, durationAt: box.body + 20, wide: false };
+}
+
+function writeDuration(view, at, wide, value) {
+  const v = Math.max(0, Math.round(value));
+  if (wide) {
+    view.setUint32(at, Math.floor(v / 4294967296));
+    view.setUint32(at + 4, v >>> 0);
+  } else {
+    view.setUint32(at, Math.min(v, UNKNOWN_DURATION - 1));
+  }
+}
+
+function sumTrunDurations(view, trun, defaultSampleDuration) {
+  const flags = view.getUint32(trun.body) & 0xffffff;
+  const count = view.getUint32(trun.body + 4);
+  if (!(flags & 0x000100)) return count * (defaultSampleDuration || 0);
+
+  let off = trun.body + 8;
+  if (flags & 0x000001) off += 4;
+  if (flags & 0x000004) off += 4;
+
+  const stride =
+    4 +
+    ((flags & 0x000200) ? 4 : 0) +
+    ((flags & 0x000400) ? 4 : 0) +
+    ((flags & 0x000800) ? 4 : 0);
+
+  let total = 0;
+  for (let i = 0; i < count && off + stride <= trun.end; i++) {
+    total += view.getUint32(off);
+    off += stride;
+  }
+  return total;
+}
+
+// Falls back to the fragments themselves when no playlist duration is known:
+// the last fragment's decode time plus the samples it carries is the exact end.
+function measureFragmentDuration(view, topBoxes, tracks) {
+  const defaults = new Map();
+  for (const t of tracks) defaults.set(t.id, t.defaultSampleDuration);
+
+  const endByTrack = new Map();
+  for (const box of topBoxes) {
+    if (box.type !== "moof") continue;
+    for (const traf of readBoxes(view, box.body, box.end)) {
+      if (traf.type !== "traf") continue;
+
+      const tfhd = findBox(view, traf, "tfhd");
+      const tfdt = findBox(view, traf, "tfdt");
+      if (!tfhd || !tfdt) continue;
+
+      const trackId = view.getUint32(tfhd.body + 4);
+      const base = view.getUint8(tfdt.body) === 1
+        ? view.getUint32(tfdt.body + 4) * 4294967296 + view.getUint32(tfdt.body + 8)
+        : view.getUint32(tfdt.body + 4);
+
+      let samples = 0;
+      for (const trun of readBoxes(view, traf.body, traf.end)) {
+        if (trun.type === "trun") samples += sumTrunDurations(view, trun, defaults.get(trackId));
+      }
+      endByTrack.set(trackId, Math.max(endByTrack.get(trackId) || 0, base + samples));
+    }
+  }
+
+  let seconds = 0;
+  for (const t of tracks) {
+    const end = endByTrack.get(t.id);
+    if (end && t.timescale) seconds = Math.max(seconds, end / t.timescale);
+  }
+  return seconds;
+}
+
+function repairFragmentedMp4Duration(bytes, knownDuration) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const top = readBoxes(view, 0, bytes.byteLength);
+
+  const moov = top.find((b) => b.type === "moov");
+  if (!moov) return 0;
+
+  const mvhd = findBox(view, moov, "mvhd");
+  if (!mvhd) return 0;
+
+  const movie = headerFields(view, mvhd);
+  const movieTimescale = view.getUint32(movie.timescaleAt);
+  if (!movieTimescale) return 0;
+
+  const mvex = findBox(view, moov, "mvex");
+  const trexDefaults = new Map();
+  if (mvex) {
+    for (const trex of readBoxes(view, mvex.body, mvex.end)) {
+      if (trex.type === "trex") trexDefaults.set(view.getUint32(trex.body + 4), view.getUint32(trex.body + 12));
+    }
+  }
+
+  const tracks = [];
+  for (const trak of readBoxes(view, moov.body, moov.end)) {
+    if (trak.type !== "trak") continue;
+    const tkhd = findBox(view, trak, "tkhd");
+    const mdia = findBox(view, trak, "mdia");
+    const mdhd = mdia && findBox(view, mdia, "mdhd");
+    if (!tkhd || !mdhd) continue;
+
+    const th = trackHeaderFields(view, tkhd);
+    const mh = headerFields(view, mdhd);
+    const id = view.getUint32(th.trackIdAt);
+    tracks.push({
+      id, tkhd, mdhd, th, mh,
+      timescale: view.getUint32(mh.timescaleAt),
+      defaultSampleDuration: trexDefaults.get(id) || 0
+    });
+  }
+
+  const seconds = knownDuration > 0 ? knownDuration : measureFragmentDuration(view, top, tracks);
+  if (!(seconds > 0)) return 0;
+
+  writeDuration(view, movie.durationAt, movie.wide, seconds * movieTimescale);
+  for (const t of tracks) {
+    writeDuration(view, t.th.durationAt, t.th.wide, seconds * movieTimescale);
+    if (t.timescale) writeDuration(view, t.mh.durationAt, t.mh.wide, seconds * t.timescale);
+  }
+  return seconds;
+}
+
+// ── Fragmented MP4 → progressive MP4 ──
+// mux.js can only emit a fragmented MP4, the shape Media Source Extensions
+// consumes: the sample tables in `moov` are left empty and every sample is
+// described inside the `moof` boxes instead. A browser reads that happily,
+// which is why the file previews in VS Code, but VLC and QuickTime read the
+// tables in `moov`, find nothing, and open an empty movie. This rebuilds the
+// file the way a player on disk expects it: real sample tables, one `mdat`,
+// no fragments.
+
+function box(type, ...parts) {
+  let length = 8;
+  for (const part of parts) length += part.length;
+
+  const out = new Uint8Array(length);
+  new DataView(out.buffer).setUint32(0, length);
+  for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+
+  let off = 8;
+  for (const part of parts) { out.set(part, off); off += part.length; }
+  return out;
+}
+
+function u32(...values) {
+  const out = new Uint8Array(values.length * 4);
+  const view = new DataView(out.buffer);
+  values.forEach((v, i) => view.setUint32(i * 4, v >>> 0));
+  return out;
+}
+
+function u32From(values) {
+  const out = new Uint8Array(values.length * 4);
+  const view = new DataView(out.buffer);
+  values.forEach((v, i) => view.setUint32(i * 4, v >>> 0));
+  return out;
+}
+
+function parseTrun(view, trun, defaults) {
+  const version = view.getUint8(trun.body);
+  const flags = view.getUint32(trun.body) & 0xffffff;
+  const count = view.getUint32(trun.body + 4);
+
+  let off = trun.body + 8;
+  let dataOffset = 0;
+  if (flags & 0x000001) { dataOffset = view.getInt32(off); off += 4; }
+  let firstFlags = null;
+  if (flags & 0x000004) { firstFlags = view.getUint32(off); off += 4; }
+
+  const samples = [];
+  for (let i = 0; i < count; i++) {
+    const sample = {
+      duration: defaults.duration,
+      size: defaults.size,
+      flags: i === 0 && firstFlags !== null ? firstFlags : defaults.flags,
+      cto: 0
+    };
+    if (flags & 0x000100) { sample.duration = view.getUint32(off); off += 4; }
+    if (flags & 0x000200) { sample.size = view.getUint32(off); off += 4; }
+    if (flags & 0x000400) { sample.flags = view.getUint32(off); off += 4; }
+    if (flags & 0x000800) {
+      sample.cto = version === 0 ? view.getUint32(off) : view.getInt32(off);
+      off += 4;
+    }
+    samples.push(sample);
+  }
+  return { samples, dataOffset };
+}
+
+// Walks every fragment and returns, per track, the flat list of samples with
+// their absolute position in the file.
+function collectFragmentSamples(view, length) {
+  const tracks = new Map();
+
+  for (const moof of readBoxes(view, 0, length)) {
+    if (moof.type !== "moof") continue;
+    const moofStart = moof.body - 8;
+
+    for (const traf of readBoxes(view, moof.body, moof.end)) {
+      if (traf.type !== "traf") continue;
+
+      const tfhd = findBox(view, traf, "tfhd");
+      if (!tfhd) continue;
+
+      const tfhdFlags = view.getUint32(tfhd.body) & 0xffffff;
+      const trackId = view.getUint32(tfhd.body + 4);
+
+      let off = tfhd.body + 8;
+      // Absent an explicit base, the spec anchors sample data to the moof.
+      let base = moofStart;
+      if (tfhdFlags & 0x000001) {
+        base = view.getUint32(off) * 4294967296 + view.getUint32(off + 4);
+        off += 8;
+      }
+      if (tfhdFlags & 0x000002) off += 4;
+
+      const defaults = { duration: 0, size: 0, flags: 0 };
+      if (tfhdFlags & 0x000008) { defaults.duration = view.getUint32(off); off += 4; }
+      if (tfhdFlags & 0x000010) { defaults.size = view.getUint32(off); off += 4; }
+      if (tfhdFlags & 0x000020) { defaults.flags = view.getUint32(off); off += 4; }
+
+      if (!tracks.has(trackId)) tracks.set(trackId, { id: trackId, samples: [], startTime: null });
+      const track = tracks.get(trackId);
+
+      // A track whose first fragment does not start at zero is offset against
+      // the others. A sample table always starts at zero, so that offset has
+      // to be carried over as an edit list or the tracks drift apart.
+      if (track.startTime === null) {
+        const tfdt = findBox(view, traf, "tfdt");
+        if (tfdt) {
+          track.startTime = view.getUint8(tfdt.body) === 1
+            ? view.getUint32(tfdt.body + 4) * 4294967296 + view.getUint32(tfdt.body + 8)
+            : view.getUint32(tfdt.body + 4);
+        }
+      }
+
+      for (const trun of readBoxes(view, traf.body, traf.end)) {
+        if (trun.type !== "trun") continue;
+        const { samples, dataOffset } = parseTrun(view, trun, defaults);
+        let at = base + dataOffset;
+        for (const sample of samples) {
+          sample.offset = at;
+          at += sample.size;
+          track.samples.push(sample);
+        }
+      }
+    }
+  }
+  return tracks;
+}
+
+function buildStts(samples) {
+  const entries = [];
+  for (const sample of samples) {
+    const last = entries[entries.length - 1];
+    if (last && last[1] === sample.duration) last[0]++;
+    else entries.push([1, sample.duration]);
+  }
+  return box("stts", u32(0, entries.length), u32From(entries.flat()));
+}
+
+function buildCtts(samples) {
+  if (!samples.some((s) => s.cto !== 0)) return null;
+  const signed = samples.some((s) => s.cto < 0);
+
+  const entries = [];
+  for (const sample of samples) {
+    const last = entries[entries.length - 1];
+    if (last && last[1] === sample.cto) last[0]++;
+    else entries.push([1, sample.cto]);
+  }
+
+  const payload = new Uint8Array(entries.length * 8);
+  const view = new DataView(payload.buffer);
+  entries.forEach(([count, offset], i) => {
+    view.setUint32(i * 8, count);
+    if (signed) view.setInt32(i * 8 + 4, offset);
+    else view.setUint32(i * 8 + 4, offset);
+  });
+
+  const header = new Uint8Array(8);
+  new DataView(header.buffer).setUint32(0, signed ? 0x01000000 : 0);
+  new DataView(header.buffer).setUint32(4, entries.length);
+  return box("ctts", header, payload);
+}
+
+function buildStsz(samples) {
+  const uniform = samples.length > 0 && samples.every((s) => s.size === samples[0].size);
+  if (uniform) return box("stsz", u32(0, samples[0].size, samples.length));
+  return box("stsz", u32(0, 0, samples.length), u32From(samples.map((s) => s.size)));
+}
+
+// Sync samples are the ones a player can seek to; without stss it assumes all
+// of them are, which makes seeking land on broken frames.
+function buildStss(samples) {
+  const sync = [];
+  samples.forEach((s, i) => { if (!(s.flags & 0x00010000)) sync.push(i + 1); });
+  if (sync.length === 0 || sync.length === samples.length) return null;
+  return box("stss", u32(0, sync.length), u32From(sync));
+}
+
+// An empty edit at the head of the track delays it by exactly the decode time
+// its first fragment declared.
+function buildDelayEdit(startTicks, mediaTimescale, movieTimescale, trackTicks) {
+  if (!startTicks || !mediaTimescale) return null;
+
+  const delay = Math.round((startTicks / mediaTimescale) * movieTimescale);
+  if (delay <= 0) return null;
+
+  const payload = new Uint8Array(4 + 4 + 24);
+  const view = new DataView(payload.buffer);
+  view.setUint32(0, 0);          // version 0, no flags
+  view.setUint32(4, 2);          // two edits
+  view.setUint32(8, delay);      // empty edit: duration ...
+  view.setInt32(12, -1);         // ... with no media behind it
+  view.setUint32(16, 0x00010000);
+  view.setUint32(20, Math.round((trackTicks / mediaTimescale) * movieTimescale));
+  view.setInt32(24, 0);          // then the track from its start
+  view.setUint32(28, 0x00010000);
+
+  return box("edts", box("elst", payload));
+}
+
+function buildStbl(view, originalStbl, samples, useCo64) {
+  const stsd = findBox(view, originalStbl, "stsd");
+  if (!stsd) return null;
+
+  const stsdBytes = new Uint8Array(view.buffer, view.byteOffset + stsd.body - 8, stsd.end - stsd.body + 8);
+
+  const parts = [
+    stsdBytes.slice(),
+    buildStts(samples),
+    // One chunk per track: every sample of the track sits in it.
+    box("stsc", u32(0, 1), u32(1, samples.length, 1)),
+    buildStsz(samples),
+    useCo64
+      ? box("co64", u32(0, 1), new Uint8Array(8))
+      : box("stco", u32(0, 1), u32(0))
+  ];
+
+  const ctts = buildCtts(samples);
+  if (ctts) parts.splice(2, 0, ctts);
+  const stss = buildStss(samples);
+  if (stss) parts.push(stss);
+
+  return box("stbl", ...parts);
+}
+
+// Rebuilds moov, dropping mvex and swapping each track's empty sample table
+// for the real one. Everything else, stsd in particular, is copied verbatim.
+function rebuildMoov(view, moov, tracks, useCo64, movieTimescale) {
+  const children = [];
+  let trackIndex = 0;
+
+  for (const child of readBoxes(view, moov.body, moov.end)) {
+    if (child.type === "mvex") continue; // no fragments in the output
+
+    if (child.type !== "trak") {
+      children.push(new Uint8Array(view.buffer, view.byteOffset + child.body - 8, child.end - child.body + 8).slice());
+      continue;
+    }
+
+    const tkhd = findBox(view, child, "tkhd");
+    const mdia = tkhd && findBox(view, child, "mdia");
+    const minf = mdia && findBox(view, mdia, "minf");
+    const stbl = minf && findBox(view, minf, "stbl");
+    const trackId = tkhd ? view.getUint32(trackHeaderFields(view, tkhd).trackIdAt) : null;
+    const track = trackId !== null ? tracks.get(trackId) : null;
+
+    if (!stbl || !track || track.samples.length === 0) {
+      children.push(new Uint8Array(view.buffer, view.byteOffset + child.body - 8, child.end - child.body + 8).slice());
+      trackIndex++;
+      continue;
+    }
+
+    const newStbl = buildStbl(view, stbl, track.samples, useCo64);
+    if (!newStbl) return null;
+
+    const newMinf = rebuildContainer(view, minf, "stbl", newStbl);
+    const newMdia = rebuildContainer(view, mdia, "minf", newMinf);
+
+    const mdhd = findBox(view, mdia, "mdhd");
+    const mediaTimescale = mdhd ? view.getUint32(headerFields(view, mdhd).timescaleAt) : 0;
+    const trackTicks = track.samples.reduce((total, sample) => total + sample.duration, 0);
+    const edts = buildDelayEdit(track.startTime, mediaTimescale, movieTimescale, trackTicks);
+
+    children.push(rebuildTrak(view, child, newMdia, edts));
+    trackIndex++;
+  }
+
+  const rebuilt = box("moov", ...children);
+  applyProgressiveDurations(rebuilt, tracks, movieTimescale);
+  return rebuilt;
+}
+
+// Rebuilds a trak with the new mdia, and with the edit list swapped in or
+// dropped depending on whether the track needs one.
+function rebuildTrak(view, trak, newMdia, edts) {
+  const parts = [];
+  for (const child of readBoxes(view, trak.body, trak.end)) {
+    if (child.type === "edts") continue;
+    if (child.type === "mdia") {
+      if (edts) parts.push(edts);
+      parts.push(newMdia);
+      continue;
+    }
+    parts.push(new Uint8Array(view.buffer, view.byteOffset + child.body - 8, child.end - child.body + 8).slice());
+  }
+  return box("trak", ...parts);
+}
+
+// Copies a container box, replacing exactly one of its children.
+function rebuildContainer(view, container, childType, replacement) {
+  const parts = [];
+  for (const child of readBoxes(view, container.body, container.end)) {
+    if (child.type === childType) parts.push(replacement);
+    else parts.push(new Uint8Array(view.buffer, view.byteOffset + child.body - 8, child.end - child.body + 8).slice());
+  }
+  const name = String.fromCharCode(
+    view.getUint8(container.body - 4), view.getUint8(container.body - 3),
+    view.getUint8(container.body - 2), view.getUint8(container.body - 1)
+  );
+  return box(name, ...parts);
+}
+
+// The durations come from the samples themselves, so they are exact and need
+// no help from the playlist.
+function applyProgressiveDurations(moovBytes, tracks, movieTimescale) {
+  const view = new DataView(moovBytes.buffer, moovBytes.byteOffset, moovBytes.byteLength);
+  const moov = { body: 8, end: moovBytes.byteLength };
+
+  const mvhd = findBox(view, moov, "mvhd");
+  if (!mvhd) return;
+  const movie = headerFields(view, mvhd);
+
+  let longest = 0;
+  for (const child of readBoxes(view, moov.body, moov.end)) {
+    if (child.type !== "trak") continue;
+
+    const tkhd = findBox(view, child, "tkhd");
+    const mdia = findBox(view, child, "mdia");
+    const mdhd = mdia && findBox(view, mdia, "mdhd");
+    if (!tkhd || !mdhd) continue;
+
+    const th = trackHeaderFields(view, tkhd);
+    const mh = headerFields(view, mdhd);
+    const track = tracks.get(view.getUint32(th.trackIdAt));
+    const timescale = view.getUint32(mh.timescaleAt);
+    if (!track || !timescale) continue;
+
+    const ticks = track.samples.reduce((total, s) => total + s.duration, 0);
+    const seconds = ticks / timescale;
+    longest = Math.max(longest, seconds);
+
+    writeDuration(view, mh.durationAt, mh.wide, ticks);
+    writeDuration(view, th.durationAt, th.wide, seconds * movieTimescale);
+  }
+
+  writeDuration(view, movie.durationAt, movie.wide, longest * movieTimescale);
+}
+
+function concatBytes(parts, total) {
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const part of parts) { out.set(part, off); off += part.length; }
+  return out;
+}
+
+// Writes the chunk offset of each track once the final layout is known, and
+// returns the track order it used so the mdat is written to match.
+function patchChunkOffsets(moovBytes, tracks, mdatDataStart) {
+  const ordered = [];
+  const view = new DataView(moovBytes.buffer, moovBytes.byteOffset, moovBytes.byteLength);
+  const moov = { body: 8, end: moovBytes.byteLength };
+
+  let cursor = mdatDataStart;
+  for (const child of readBoxes(view, moov.body, moov.end)) {
+    if (child.type !== "trak") continue;
+
+    const tkhd = findBox(view, child, "tkhd");
+    const mdia = findBox(view, child, "mdia");
+    const minf = mdia && findBox(view, mdia, "minf");
+    const stbl = minf && findBox(view, minf, "stbl");
+    if (!tkhd || !stbl) continue;
+
+    const track = tracks.get(view.getUint32(trackHeaderFields(view, tkhd).trackIdAt));
+    if (!track || track.samples.length === 0) continue;
+
+    const stco = findBox(view, stbl, "stco");
+    const co64 = findBox(view, stbl, "co64");
+    if (co64) {
+      view.setUint32(co64.body + 8, Math.floor(cursor / 4294967296));
+      view.setUint32(co64.body + 12, cursor % 4294967296);
+    } else if (stco) {
+      view.setUint32(stco.body + 8, cursor);
+    }
+    ordered.push(track);
+    cursor += track.samples.reduce((total, s) => total + s.size, 0);
+  }
+  return ordered;
+}
+
+function fragmentedToProgressiveMp4(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const top = readBoxes(view, 0, bytes.byteLength);
+
+  const ftyp = top.find((b) => b.type === "ftyp");
+  const moov = top.find((b) => b.type === "moov");
+  if (!ftyp || !moov) return null;
+
+  const mvhd = findBox(view, moov, "mvhd");
+  if (!mvhd) return null;
+  const movieTimescale = view.getUint32(headerFields(view, mvhd).timescaleAt);
+  if (!movieTimescale) return null;
+
+  const tracks = collectFragmentSamples(view, bytes.byteLength);
+  if (tracks.size === 0) return null;
+
+  let payload = 0;
+  for (const track of tracks.values()) {
+    for (const sample of track.samples) {
+      if (sample.offset + sample.size > bytes.byteLength) return null;
+      payload += sample.size;
+    }
+  }
+  if (payload === 0) return null;
+
+  const useCo64 = payload > 0xf0000000;
+  const newMoov = rebuildMoov(view, moov, tracks, useCo64, movieTimescale);
+  if (!newMoov) return null;
+
+  const ftypBytes = new Uint8Array(view.buffer, view.byteOffset + ftyp.body - 8, ftyp.end - ftyp.body + 8).slice();
+  const wideMdat = payload + 8 > 0xfffffff0;
+  const mdatHeader = new Uint8Array(wideMdat ? 16 : 8);
+  const headerView = new DataView(mdatHeader.buffer);
+  if (wideMdat) {
+    headerView.setUint32(0, 1);
+    for (let i = 0; i < 4; i++) mdatHeader[4 + i] = "mdat".charCodeAt(i);
+    headerView.setUint32(8, Math.floor((payload + 16) / 4294967296));
+    headerView.setUint32(12, (payload + 16) % 4294967296);
+  } else {
+    headerView.setUint32(0, payload + 8);
+    for (let i = 0; i < 4; i++) mdatHeader[4 + i] = "mdat".charCodeAt(i);
+  }
+
+  const mdatDataStart = ftypBytes.length + newMoov.length + mdatHeader.length;
+  const ordered = patchChunkOffsets(newMoov, tracks, mdatDataStart);
+  if (ordered.length === 0) return null;
+
+  const out = new Uint8Array(mdatDataStart + payload);
+  out.set(ftypBytes, 0);
+  out.set(newMoov, ftypBytes.length);
+  out.set(mdatHeader, ftypBytes.length + newMoov.length);
+
+  let cursor = mdatDataStart;
+  for (const track of ordered) {
+    for (const sample of track.samples) {
+      out.set(bytes.subarray(sample.offset, sample.offset + sample.size), cursor);
+      cursor += sample.size;
+    }
+  }
+  return out;
+}
+
 // Merge downloaded segments, remux to MP4, and hand the result to the browser.
 // Falls back to writing the raw transport stream when remuxing fails.
-async function writeSegmentsAsVideo(chunks, filename, progressKey, tabId) {
+async function writeSegmentsAsVideo(chunks, filename, progressKey, tabId, knownDuration) {
   const tsBlob = mergeChunks(chunks);
   const tsData = new Uint8Array(await tsBlob.arrayBuffer());
 
@@ -556,7 +1279,16 @@ async function writeSegmentsAsVideo(chunks, filename, progressKey, tabId) {
 
   try {
     reportProgress(progressKey, -1, "Remuxing to MP4...");
-    const mp4Data = await transmuxTStoMP4(tsData);
+    const fragmented = await transmuxTStoMP4(tsData);
+
+    // A fragmented MP4 opens as an empty movie in VLC and QuickTime, so the
+    // file is rewritten with real sample tables before it is handed over.
+    let mp4Data = fragmentedToProgressiveMp4(fragmented);
+    if (!mp4Data) {
+      mp4Data = fragmented;
+      repairFragmentedMp4Duration(mp4Data, knownDuration);
+    }
+
     const mp4BlobUrl = URL.createObjectURL(new Blob([mp4Data], { type: "video/mp4" }));
     const dlId = await startDownload({ url: mp4BlobUrl, filename: mp4Filename }, tabId);
     return { downloadId: dlId, filename: mp4Filename };
@@ -568,15 +1300,15 @@ async function writeSegmentsAsVideo(chunks, filename, progressKey, tabId) {
   }
 }
 
-async function downloadAudioRendition(audioSegmentUrls, filename, progressKey, tabId) {
+async function downloadAudioRendition(audioSegmentUrls, filename, progressKey, tabId, ctx) {
   reportProgress(progressKey, -1, "Downloading separate audio track...");
 
-  const chunks = await downloadSegmentsWithProgress(
-    audioSegmentUrls, progressKey, 0, audioSegmentUrls.length, isPrivateTab(tabId)
+  const { chunks } = await downloadSegmentsWithProgress(
+    audioSegmentUrls, progressKey, 0, audioSegmentUrls.length, ctx
   );
   if (chunks.length === 0) return null;
 
-  const ext = /\.aac(\?|$)/i.test(audioSegmentUrls[0]) ? ".aac" : ".m4a";
+  const ext = /\.aac(\?|$)/i.test(audioSegmentUrls[0].url) ? ".aac" : ".m4a";
   const base = filename.replace(/\.(m3u8|mpd|ts|aac|m4a|mp4|ism).*$/i, "") || "audio";
   const audioFilename = base + ".audio" + ext;
 
@@ -585,40 +1317,66 @@ async function downloadAudioRendition(audioSegmentUrls, filename, progressKey, t
   return { filename: audioFilename };
 }
 
+// Picks the single captured stream that belongs to this manifest. Merging
+// every stream of the domain used to interleave unrelated renditions — a
+// 720p segment after a 1080p one, or audio inside the video track — which is
+// what made downloads play back as garbage.
 function collectCapturedSegments(tabId, masterUrl) {
   if (!tabStreams[tabId]) return [];
 
+  const masterKey = getStreamKey(masterUrl);
   const masterDomain = getDomain(masterUrl);
-  const allSegmentUrls = [];
+
+  let best = null;
+  let bestScore = -1;
 
   for (const [key, stream] of tabStreams[tabId]) {
-    if (stream.domain === masterDomain || key.startsWith(masterDomain)) {
-      stream.segments.forEach((s) => {
-        if (!allSegmentUrls.includes(s.url)) {
-          allSegmentUrls.push(s.url);
-        }
-      });
+    let score = -1;
+    if (stream.manifestUrl === masterUrl) score = 3;
+    else if (masterKey && (key.startsWith(masterKey) || masterKey.startsWith(key))) score = 2;
+    else if (stream.domain === masterDomain) score = 1;
+    if (score < 0) continue;
+
+    // Same relevance: keep the stream we captured the most of.
+    if (score > bestScore || (score === bestScore && stream.segments.length > best.segments.length)) {
+      best = stream;
+      bestScore = score;
     }
   }
 
-  return allSegmentUrls;
+  // A bare domain match is too weak to trust when several streams compete.
+  if (!best || bestScore < 1) return [];
+  if (bestScore === 1) {
+    const sameDomain = Array.from(tabStreams[tabId].values()).filter((s) => s.domain === masterDomain);
+    if (sameDomain.length > 1) return [];
+  }
+
+  const seen = new Set();
+  const segments = [];
+  for (const seg of best.segments) {
+    if (seen.has(seg.url)) continue;
+    seen.add(seg.url);
+    segments.push({ url: seg.url });
+  }
+  return segments;
 }
 
 // Returns { video: [...], audio: [...] } — the audio list is only populated
 // when the manifest carries the audio as a rendition of its own.
-async function getManifestSegments(m3u8Url, qualityHeight, isPrivate) {
+async function getManifestSegments(m3u8Url, qualityHeight, ctx) {
   try {
-    const parsed = await parseM3U8(m3u8Url, isPrivate);
-    if (!parsed) return { video: [], audio: [] };
-    return await getSegmentsFromStoredManifest(parsed, qualityHeight, isPrivate);
+    const parsed = await parseM3U8(m3u8Url, ctx);
+    if (!parsed) return { video: [], audio: [], duration: 0 };
+    return await getSegmentsFromStoredManifest(parsed, qualityHeight, ctx);
   } catch {
-    return { video: [], audio: [] };
+    return { video: [], audio: [], duration: 0 };
   }
 }
 
-async function getSegmentsFromStoredManifest(parsed, qualityHeight, isPrivate) {
+async function getSegmentsFromStoredManifest(parsed, qualityHeight, ctx) {
   let videoSegmentUrls = [];
   let audioSegmentUrls = [];
+  let duration = 0;
 
   if (parsed.variants && parsed.variants.length > 0) {
     let chosenVariant;
@@ -630,38 +1388,43 @@ async function getSegmentsFromStoredManifest(parsed, qualityHeight, isPrivate) {
     }
 
     try {
-      const variantData = await parseM3U8(chosenVariant.url, isPrivate);
-      if (variantData) videoSegmentUrls = variantData.segments;
+      const variantData = await parseM3U8(chosenVariant.url, ctx);
+      if (variantData) {
+        videoSegmentUrls = variantData.segments;
+        duration = variantData.totalDuration || 0;
+      }
     } catch {}
 
     if (parsed.audioGroups && parsed.audioGroups.length > 0) {
       try {
-        const audioData = await parseM3U8(parsed.audioGroups[0].url, isPrivate);
+        const audioData = await parseM3U8(parsed.audioGroups[0].url, ctx);
         if (audioData) audioSegmentUrls = audioData.segments;
       } catch {}
     }
   } else if (parsed.segments) {
     videoSegmentUrls = parsed.segments;
+    duration = parsed.totalDuration || 0;
   }
 
-  return { video: videoSegmentUrls, audio: audioSegmentUrls };
+  return { video: videoSegmentUrls, audio: audioSegmentUrls, duration };
 }
 
-async function downloadSegmentsWithProgress(segmentUrls, progressKey, startIndex, totalSegments, isPrivate) {
+async function downloadSegmentsWithProgress(segments, progressKey, startIndex, totalSegments, ctx) {
   const chunks = [];
   let downloaded = 0;
   let failed = 0;
   const BATCH_SIZE = 6;
 
-  for (let i = 0; i < segmentUrls.length; i += BATCH_SIZE) {
-    const batch = segmentUrls.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < segments.length; i += BATCH_SIZE) {
+    const batch = segments.slice(i, i + BATCH_SIZE);
     const results = await Promise.allSettled(
-      batch.map((segUrl) =>
-        mediaFetch(segUrl, isPrivate).then((resp) => {
+      batch.map((segment) => {
+        const range = segmentRange(segment);
+        return mediaFetch(segment.url, ctx, range).then(async (resp) => {
           if (!resp.ok) throw new Error(resp.status);
-          return resp.arrayBuffer();
-        })
-      )
+          return sliceRangeResponse(await resp.arrayBuffer(), resp.status, range);
+        });
+      })
     );
 
     results.forEach((result) => {
@@ -678,7 +1441,7 @@ async function downloadSegmentsWithProgress(segmentUrls, progressKey, startIndex
     reportProgress(progressKey, globalProgress, `${startIndex + downloaded}/${totalSegments}${failText}`);
   }
 
-  return chunks;
+  return { chunks, failed };
 }
 
 function reportProgress(url, progress, label) {
@@ -708,25 +1471,26 @@ async function downloadConsolidatedStream(tabId, streamKey, filename) {
 
   const stream = streams.get(streamKey);
 
+  const progressKey = "stream://" + streamKey;
+
   if (stream.manifestUrl) {
-    return downloadStream(tabId, stream.manifestUrl, filename);
+    return downloadStream(tabId, stream.manifestUrl, filename, null, progressKey);
   }
 
-  const segmentUrls = stream.segments.map((s) => s.url);
+  const segmentUrls = stream.segments.map((s) => ({ url: s.url }));
   if (segmentUrls.length === 0) {
     return { error: "No segments captured. Play the video first." };
   }
 
-  const progressKey = "stream://" + streamKey;
-  const chunks = await downloadSegmentsWithProgress(
-    segmentUrls, progressKey, 0, segmentUrls.length, isPrivateTab(tabId)
+  const ctx = tabContext(tabId);
+  const video = await downloadSegmentsWithProgress(
+    segmentUrls, progressKey, 0, segmentUrls.length, ctx
   );
 
-  if (chunks.length === 0) {
-    return { error: "All segment downloads failed" };
-  }
+  const incomplete = segmentFailureError(video, segmentUrls.length, ctx);
+  if (incomplete) return incomplete;
 
-  const result = await writeSegmentsAsVideo(chunks, filename, progressKey, tabId);
+  const result = await writeSegmentsAsVideo(video.chunks, filename, progressKey, tabId);
   result.segments = segmentUrls.length;
   return result;
 }
@@ -836,6 +1600,8 @@ browser.webRequest.onHeadersReceived.addListener(
     if (details.tabId < 0) return;
 
     markTabPrivacy(details.tabId, details.incognito);
+    const pageUrl = details.documentUrl || details.originUrl;
+    if (pageUrl && !pageUrl.startsWith("moz-extension:")) tabPageUrl[details.tabId] = pageUrl;
 
     const url = details.url;
     let fileSize = null;
@@ -873,7 +1639,7 @@ browser.webRequest.onHeadersReceived.addListener(
 
       if (isManifest && fileSize && fileSize < 50000) {
         if (isM3U8) {
-          parseM3U8(url, details.incognito).then((parsed) => {
+          parseM3U8(url, tabContext(details.tabId)).then((parsed) => {
             if (!parsed) return;
             linkManifestToStreams(details.tabId, url, parsed);
           });
@@ -884,7 +1650,7 @@ browser.webRequest.onHeadersReceived.addListener(
       if (/auth|token|drm|license|widevine|playready/i.test(url)) return;
 
       if (isM3U8) {
-        parseM3U8(url, details.incognito).then((parsed) => {
+        parseM3U8(url, tabContext(details.tabId)).then((parsed) => {
           if (!parsed) return;
 
           linkManifestToStreams(details.tabId, url, parsed);
@@ -949,6 +1715,7 @@ browser.tabs.onRemoved.addListener((tabId) => {
   delete tabTitles[tabId];
   delete tabWatchMode[tabId];
   delete tabPrivate[tabId];
+  delete tabPageUrl[tabId];
 });
 
 browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {

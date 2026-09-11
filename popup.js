@@ -74,7 +74,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       } else {
         downloadStates[message.url] = { state: "downloading", progress: message.progress, label: message.label };
       }
-      renderSingleButton(message.url);
+      renderDownloadState(message.url);
     }
     if (message.action === "queue_update") {
       updateQueueBar(message.queueLength, message.activeDownloads);
@@ -501,11 +501,14 @@ function render() {
 
 function renderMediaItem(container, media) {
   const item = document.createElement("div");
-  item.className = "media-item" + (media.duplicate ? " is-duplicate" : "");
-  item.dataset.url = media.url;
-
   const isSelected = selectedUrls.has(media.url);
   const dlState = downloadStates[media.url];
+
+  const baseClass = "media-item" + (media.duplicate ? " is-duplicate" : "");
+  item.className = baseClass + progressRowClass(dlState);
+  item.dataset.rowClass = baseClass;
+  item.dataset.url = media.url;
+  item.dataset.progressUrl = media.url;
   const isStream = media.isConsolidatedStream;
   const isHLSMaster = media.isHLSMaster;
 
@@ -544,11 +547,13 @@ function renderMediaItem(container, media) {
   const copyUrl = isStream ? (media.manifestUrl || media.realUrls?.[0] || media.url) : media.url;
 
   item.innerHTML = `
+    ${progressBarHtml(dlState)}
     <input type="checkbox" class="media-check" data-url="${escapeHtml(media.url)}" ${isSelected ? "checked" : ""}>
     <div class="media-thumb">${thumbHtml}</div>
     <div class="media-info">
       <div class="media-filename" title="${escapeHtml(media.filename)}">${isStream ? "\uD83D\uDD17 " : ""}${escapeHtml(media.filename)}</div>
       <div class="media-meta">
+        <span class="progress-label">${progressLabelText(dlState)}</span>
         ${streamTypeTag}
         ${qualityHtml}
         ${resHtml}
@@ -609,13 +614,16 @@ function renderQualityGroup(container, group) {
 
   const best = group.base;
   const variantCount = group.variants.length;
+  const bestState = downloadStates[best.url];
 
   groupEl.innerHTML = `
-    <div class="quality-group-header">
+    <div class="quality-group-header${progressRowClass(bestState)}" data-progress-url="${escapeHtml(best.url)}" data-row-class="quality-group-header">
+      ${progressBarHtml(bestState)}
       <span class="arrow">&#9654;</span>
       <div class="media-info" style="flex:1;min-width:0">
         <div class="media-filename" title="${escapeHtml(best.filename)}">${escapeHtml(best.filename)}</div>
         <div class="media-meta">
+          <span class="progress-label">${progressLabelText(bestState)}</span>
           <span class="tag ${best.type}">${getExtension(best.filename) || best.type.toUpperCase()}</span>
           <span>${variantCount} qualities available</span>
           <span>${escapeHtml(best.domain)}</span>
@@ -623,8 +631,8 @@ function renderQualityGroup(container, group) {
       </div>
       <div class="media-actions">
         <button class="copy-btn action-btn" data-url="${escapeHtml(best.url)}" title="Copy best URL">${COPY_ICON}</button>
-        <button class="dl-btn action-btn" data-url="${escapeHtml(best.url)}" data-filename="${escapeHtml(best.filename)}">
-          <span class="btn-text">\u2193</span>
+        <button class="dl-btn action-btn ${bestState ? bestState.state : ""}" data-url="${escapeHtml(best.url)}" data-filename="${escapeHtml(best.filename)}">
+          ${bestState ? getDlButtonContent(bestState) : '<span class="btn-text">\u2193</span>'}
         </button>
       </div>
     </div>
@@ -660,16 +668,23 @@ function renderQualityGroup(container, group) {
 
   group.variants.forEach((v) => {
     const varEl = document.createElement("div");
-    varEl.className = "quality-variant";
+    const vState = downloadStates[v.url];
+    varEl.className = "quality-variant" + progressRowClass(vState);
+    varEl.dataset.rowClass = "quality-variant";
+    varEl.dataset.progressUrl = v.url;
     varEl.innerHTML = `
+      ${progressBarHtml(vState)}
       <div class="variant-info">
+        <span class="progress-label">${progressLabelText(vState)}</span>
         <span class="quality-badge">${v.quality || "?"}p</span>
         <span style="font-size:10px;color:var(--text-dim)">${v.bandwidth ? (v.bandwidth / 1000).toFixed(0) + " kbps" : ""}</span>
         <span style="font-size:10px;color:var(--text-dim)">${v.size ? formatSize(v.size) : ""}</span>
       </div>
       <div class="media-actions">
         <button class="copy-btn action-btn" title="Copy URL">${COPY_ICON}</button>
-        <button class="dl-btn action-btn"><span class="btn-text">\u2193</span></button>
+        <button class="dl-btn action-btn ${vState ? vState.state : ""}" data-url="${escapeHtml(v.url)}" data-filename="${escapeHtml(v.filename)}">
+          ${vState ? getDlButtonContent(vState) : '<span class="btn-text">\u2193</span>'}
+        </button>
       </div>
     `;
 
@@ -687,13 +702,46 @@ function renderQualityGroup(container, group) {
 
 function getDlButtonContent(state) {
   if (state.state === "downloading") {
-    const pct = state.progress > 0 ? Math.round(state.progress) : 0;
-    const label = state.label && state.progress >= 90 ? "MUX" : pct + "%";
-    return `<div class="progress-fill" style="width:${pct}%"></div><span class="btn-text">${label}</span>`;
+    if (isMuxing(state)) return '<span class="btn-text">MUX</span>';
+    return `<span class="btn-text">${Math.round(state.progress > 0 ? state.progress : 0)}%</span>`;
   }
   if (state.state === "queued") return '<span class="btn-text">Q</span>';
   if (state.state === "done") return '<span class="btn-text">\u2713</span>';
   return '<span class="btn-text">\u2193</span>';
+}
+
+// ── Row progress ──
+// A download fills its whole row rather than the 28px button, so the bar is
+// readable and the background script's status text has somewhere to live.
+
+function isMuxing(state) {
+  return state.state === "downloading" && state.progress >= 90 && !!state.label;
+}
+
+function progressRowClass(state) {
+  if (!state) return "";
+  if (state.state === "queued") return " is-queued";
+  if (state.state === "done") return " is-done";
+  if (state.state === "downloading") return isMuxing(state) ? " is-downloading is-muxing" : " is-downloading";
+  return "";
+}
+
+function progressWidth(state) {
+  if (!state) return 0;
+  if (state.state === "done" || state.state === "queued") return 100;
+  return Math.max(0, Math.min(100, state.progress || 0));
+}
+
+function progressLabelText(state) {
+  if (!state) return "";
+  if (state.state === "queued") return "Queued";
+  if (state.state === "done") return "Done";
+  if (state.state !== "downloading") return "";
+  return state.label || Math.round(state.progress || 0) + "%";
+}
+
+function progressBarHtml(state) {
+  return `<div class="row-progress" style="width:${progressWidth(state)}%"></div>`;
 }
 
 function showEmpty() {
@@ -847,7 +895,7 @@ function downloadMedia(media) {
   if (downloadStates[media.url] && (downloadStates[media.url].state === "downloading" || downloadStates[media.url].state === "queued")) return;
 
   downloadStates[media.url] = { state: "queued", progress: 0 };
-  renderSingleButton(media.url);
+  renderDownloadState(media.url);
 
   browser.runtime.sendMessage({
     action: "download",
@@ -861,11 +909,11 @@ function downloadMedia(media) {
     if (response && response.error) {
       showToast("Error: " + response.error);
       delete downloadStates[media.url];
-      renderSingleButton(media.url);
+      renderDownloadState(media.url);
     }
   }).catch(() => {
     delete downloadStates[media.url];
-    renderSingleButton(media.url);
+    renderDownloadState(media.url);
   });
 }
 
@@ -874,14 +922,14 @@ function handleDownloadUpdate(message) {
 
   if (message.state === "started") {
     downloadStates[url] = { state: "downloading", progress: 0 };
-    renderSingleButton(url);
+    renderDownloadState(url);
     trackDownload(url, message.downloadId);
     return;
   }
 
   if (message.state === "done") {
     downloadStates[url] = { state: "done", progress: 100 };
-    renderSingleButton(url);
+    renderDownloadState(url);
     if (message.fallback) showToast("Remux failed — saved as .ts");
     if (message.separateAudio) showToast("Audio track saved separately: " + message.audioFilename);
     return;
@@ -890,7 +938,7 @@ function handleDownloadUpdate(message) {
   if (message.state === "error") {
     showToast("Error: " + message.error);
     delete downloadStates[url];
-    renderSingleButton(url);
+    renderDownloadState(url);
   }
 }
 
@@ -917,27 +965,37 @@ function trackDownload(url, downloadId) {
       if (!resp) return;
       if (resp.state === "complete") {
         downloadStates[url] = { state: "done", progress: 100 };
-        renderSingleButton(url);
+        renderDownloadState(url);
         clearInterval(interval);
       } else if (resp.state === "interrupted") {
         delete downloadStates[url];
-        renderSingleButton(url);
+        renderDownloadState(url);
         clearInterval(interval);
       } else if (resp.totalBytes > 0) {
         const pct = (resp.bytesReceived / resp.totalBytes) * 100;
         downloadStates[url] = { state: "downloading", progress: pct };
-        renderSingleButton(url);
+        renderDownloadState(url);
       }
     });
   }, 500);
 }
 
-function renderSingleButton(url) {
-  const btn = document.querySelector(`.dl-btn[data-url="${CSS.escape(url)}"]`);
-  if (!btn) return;
+function renderDownloadState(url) {
   const state = downloadStates[url];
-  btn.className = "dl-btn action-btn " + (state ? state.state : "");
-  btn.innerHTML = state ? getDlButtonContent(state) : '<span class="btn-text">\u2193</span>';
+  const sel = CSS.escape(url);
+
+  document.querySelectorAll(`[data-progress-url="${sel}"]`).forEach((row) => {
+    row.className = (row.dataset.rowClass || row.className) + progressRowClass(state);
+    const fill = row.querySelector(".row-progress");
+    if (fill) fill.style.width = progressWidth(state) + "%";
+    const label = row.querySelector(".progress-label");
+    if (label) label.textContent = progressLabelText(state);
+  });
+
+  document.querySelectorAll(`.dl-btn[data-url="${sel}"]`).forEach((btn) => {
+    btn.className = "dl-btn action-btn " + (state ? state.state : "");
+    btn.innerHTML = state ? getDlButtonContent(state) : '<span class="btn-text">\u2193</span>';
+  });
 }
 
 // ── Batch rename ──
@@ -999,7 +1057,7 @@ function executeBatchRename() {
       showToast(`${resp.queued} downloads queued with custom names`);
       items.forEach((m) => {
         downloadStates[m.url] = { state: "queued", progress: 0 };
-        renderSingleButton(m.url);
+        renderDownloadState(m.url);
       });
     }
   });
