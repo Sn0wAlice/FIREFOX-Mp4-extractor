@@ -15,6 +15,7 @@ let pageTitle = "";
 let currentTheme = "dark";
 let options = {};
 let watchMode = false;
+let isPrivateContext = false;
 let sizeFilterMB = 0;
 let metadataCache = new Map(); // url -> { resolution, duration }
 
@@ -38,6 +39,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (response && response.media) {
     allMedia = deduplicateMedia(response.media);
     pageTitle = response.pageTitle || "";
+    isPrivateContext = !!response.isPrivate;
     watchMode = response.watchMode || false;
     updateWatchButton();
     updateQueueBar(response.queueLength || 0, response.activeDownloads || 0);
@@ -76,6 +78,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
     if (message.action === "queue_update") {
       updateQueueBar(message.queueLength, message.activeDownloads);
+    }
+    if (message.action === "dl_update") {
+      handleDownloadUpdate(message);
     }
     if (message.action === "watch_new_media") {
       if (watchMode && message.media) {
@@ -827,7 +832,11 @@ function exportMedia(format) {
 function downloadAsFile(content, filename, mimeType) {
   const blob = new Blob([content], { type: mimeType });
   const url = URL.createObjectURL(blob);
-  browser.downloads.download({ url, filename }).then(() => {
+  // An export lists the URLs seen in the tab, so in a private window it belongs
+  // to the private download session like any other download.
+  const opts = { url, filename };
+  if (isPrivateContext) opts.incognito = true;
+  browser.downloads.download(opts).then(() => {
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   });
 }
@@ -847,25 +856,42 @@ function downloadMedia(media) {
     pageTitle,
     quality: media.quality
   }).then((response) => {
-    if (response && response.downloadId) {
-      downloadStates[media.url] = { state: "downloading", progress: 0 };
-      renderSingleButton(media.url);
-      trackDownload(media.url, response.downloadId);
-    } else if (response && response.segments) {
-      downloadStates[media.url] = { state: "done", progress: 100 };
-      renderSingleButton(media.url);
-    } else if (response && response.error) {
+    // The item is only queued at this point; progress and completion arrive
+    // later as dl_update messages from the background script.
+    if (response && response.error) {
       showToast("Error: " + response.error);
       delete downloadStates[media.url];
-      renderSingleButton(media.url);
-    } else {
-      downloadStates[media.url] = { state: "done" };
       renderSingleButton(media.url);
     }
   }).catch(() => {
     delete downloadStates[media.url];
     renderSingleButton(media.url);
   });
+}
+
+function handleDownloadUpdate(message) {
+  const url = message.url;
+
+  if (message.state === "started") {
+    downloadStates[url] = { state: "downloading", progress: 0 };
+    renderSingleButton(url);
+    trackDownload(url, message.downloadId);
+    return;
+  }
+
+  if (message.state === "done") {
+    downloadStates[url] = { state: "done", progress: 100 };
+    renderSingleButton(url);
+    if (message.fallback) showToast("Remux failed — saved as .ts");
+    if (message.separateAudio) showToast("Audio track saved separately: " + message.audioFilename);
+    return;
+  }
+
+  if (message.state === "error") {
+    showToast("Error: " + message.error);
+    delete downloadStates[url];
+    renderSingleButton(url);
+  }
 }
 
 // Download best quality of each unique video

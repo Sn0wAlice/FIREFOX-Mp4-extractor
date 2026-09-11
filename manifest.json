@@ -30,7 +30,7 @@
   },
   "background": {
     "scripts": ["lib/mux-shim.js", "background.js"],
-    "persistent": false
+    "persistent": true
   },
   "content_scripts": [{
     "matches": ["<all_urls>"],

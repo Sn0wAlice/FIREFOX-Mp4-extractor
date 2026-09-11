@@ -8,7 +8,11 @@ const MEDIA_CONTENT_TYPES = /^(video|audio)\//i;
 const QUALITY_REGEX = /(\d{3,4})p|(\d{3,4})x(\d{3,4})|[_\-.](\d{3,4})[_\-.]/i;
 
 // Patterns that indicate a segment (not a standalone file)
-const SEGMENT_EXTENSIONS = /\.(ts|m4s|m4f|m4v|m4a|aac|fmp4|cmfv|cmfa)(\?|$)/i;
+const SEGMENT_EXTENSIONS = /\.(ts|m4s|m4f|aac|fmp4|cmfv|cmfa)(\?|$)/i;
+// .m4a and .m4v are standalone media formats that some packagers also emit as
+// segments — only treat them as segments when the URL or the size says so
+const AMBIGUOUS_SEGMENT_EXTENSIONS = /\.(m4v|m4a)(\?|$)/i;
+const AMBIGUOUS_SEGMENT_MAX_SIZE = 2 * 1024 * 1024;
 const SEGMENT_URL_PATTERNS = /segment|chunk|frag|seq\d|seg\d|part\d|media=|range=|sq=|\d{4,}\.aac|\d{4,}\.ts/i;
 
 // Store detected media per tab
@@ -23,6 +27,8 @@ const downloadedFiles = new Map();
 const tabTitles = {};
 // Watch mode per tab
 const tabWatchMode = {};
+// Which tabs belong to a private browsing window
+const tabPrivate = {};
 // Download queue
 const downloadQueue = [];
 let activeDownloads = 0;
@@ -94,6 +100,39 @@ function getContentFingerprint(url) {
   }
 }
 
+// ── Private browsing ──
+// Media found in a private window must stay in the private session: its
+// downloads belong to the private download manager, its network requests must
+// not carry normal-session cookies, and it must leave nothing in shared state.
+
+function markTabPrivacy(tabId, isPrivate) {
+  if (typeof tabId !== "number" || tabId < 0) return;
+  if (isPrivate) tabPrivate[tabId] = true;
+  else delete tabPrivate[tabId];
+}
+
+function isPrivateTab(tabId) {
+  return !!tabPrivate[tabId];
+}
+
+// Downloads started for a private tab are attached to the private session, so
+// they show up in the private download manager and not in normal history.
+function startDownload(options, tabId) {
+  return browser.downloads.download(
+    isPrivateTab(tabId) ? { ...options, incognito: true } : options
+  );
+}
+
+// Requests made on behalf of a private tab are sent without credentials so the
+// normal-session cookie jar of the background page is never exposed to the CDN.
+function mediaFetch(url, isPrivate) {
+  return isPrivate ? fetch(url, { credentials: "omit" }) : fetch(url);
+}
+
+function resolveUrl(raw, baseUrl) {
+  try { return new URL(raw, baseUrl).href; } catch { return null; }
+}
+
 function isBlacklisted(url, blacklist) {
   if (!blacklist || !blacklist.length) return false;
   const lower = url.toLowerCase();
@@ -148,11 +187,14 @@ function applyBatchRename(media, pageTitle, pattern, index, total) {
 
 // ── Segment detection & stream grouping ──
 
-function isSegment(url, contentType) {
+function isSegment(url, contentType, size) {
   if (SEGMENT_EXTENSIONS.test(url)) return true;
   if (SEGMENT_URL_PATTERNS.test(url)) return true;
   const filename = getFilenameFromUrl(url);
-  if (/^\d+\.(aac|ts|m4s|mp4)$/i.test(filename)) return true;
+  if (/^\d+\.(aac|ts|m4s|m4a|m4v|mp4)$/i.test(filename)) return true;
+  if (AMBIGUOUS_SEGMENT_EXTENSIONS.test(url)) {
+    return typeof size === "number" && size > 0 && size < AMBIGUOUS_SEGMENT_MAX_SIZE;
+  }
   return false;
 }
 
@@ -333,12 +375,11 @@ function updateBadge(tabId) {
 
 // ── HLS/DASH parsing ──
 
-async function parseM3U8(url) {
+async function parseM3U8(url, isPrivate) {
   try {
-    const resp = await fetch(url);
+    const resp = await mediaFetch(url, isPrivate);
     const text = await resp.text();
     const lines = text.split("\n").map((l) => l.trim());
-    const baseUrl = url.substring(0, url.lastIndexOf("/") + 1);
     const result = { masterUrl: url, variants: [], segments: [], audioGroups: [], totalDuration: 0 };
 
     const isMaster = lines.some((l) => l.startsWith("#EXT-X-STREAM-INF"));
@@ -350,7 +391,8 @@ async function parseM3U8(url) {
           const nameMatch = lines[i].match(/NAME="([^"]+)"/);
           const langMatch = lines[i].match(/LANGUAGE="([^"]+)"/);
           if (uriMatch) {
-            const audioUrl = uriMatch[1].startsWith("http") ? uriMatch[1] : baseUrl + uriMatch[1];
+            const audioUrl = resolveUrl(uriMatch[1], url);
+            if (!audioUrl) continue;
             result.audioGroups.push({
               url: audioUrl,
               name: nameMatch ? nameMatch[1] : "audio",
@@ -367,7 +409,8 @@ async function parseM3U8(url) {
           const resMatch = info.match(/RESOLUTION=(\d+)x(\d+)/);
           const nextLine = lines[i + 1];
           if (nextLine && !nextLine.startsWith("#")) {
-            const variantUrl = nextLine.startsWith("http") ? nextLine : baseUrl + nextLine;
+            const variantUrl = resolveUrl(nextLine, url);
+            if (!variantUrl) continue;
             result.variants.push({
               url: variantUrl,
               bandwidth: bwMatch ? parseInt(bwMatch[1]) : 0,
@@ -387,8 +430,8 @@ async function parseM3U8(url) {
           if (!isNaN(dur)) duration += dur;
         }
         if (line && !line.startsWith("#")) {
-          const segUrl = line.startsWith("http") ? line : baseUrl + line;
-          result.segments.push(segUrl);
+          const segUrl = resolveUrl(line, url);
+          if (segUrl) result.segments.push(segUrl);
         }
       }
       result.totalDuration = duration;
@@ -442,19 +485,22 @@ function transmuxTStoMP4(tsData) {
 
 async function downloadStream(tabId, url, filename, qualityHeight) {
   const progressKey = url;
+  const isPrivate = isPrivateTab(tabId);
 
   const capturedSegments = collectCapturedSegments(tabId, url);
 
-  let manifestSegments = null;
+  let manifest = null;
   if (/\.m3u8(\?|$)/i.test(url)) {
-    manifestSegments = await getManifestSegments(url, qualityHeight);
+    manifest = await getManifestSegments(url, qualityHeight, isPrivate);
   }
 
   let segmentUrls = [];
+  let audioSegmentUrls = [];
   let source = "";
 
-  if (manifestSegments && manifestSegments.length > 0) {
-    segmentUrls = manifestSegments;
+  if (manifest && manifest.video.length > 0) {
+    segmentUrls = manifest.video;
+    audioSegmentUrls = manifest.audio;
     source = "manifest";
   } else if (capturedSegments.length > 0) {
     segmentUrls = capturedSegments;
@@ -462,7 +508,9 @@ async function downloadStream(tabId, url, filename, qualityHeight) {
   } else {
     const storedParsed = tabHLS[tabId] && tabHLS[tabId].get(url);
     if (storedParsed) {
-      segmentUrls = await getSegmentsFromStoredManifest(storedParsed, qualityHeight);
+      const stored = await getSegmentsFromStoredManifest(storedParsed, qualityHeight, isPrivate);
+      segmentUrls = stored.video;
+      audioSegmentUrls = stored.audio;
       source = "stored";
     }
   }
@@ -473,12 +521,33 @@ async function downloadStream(tabId, url, filename, qualityHeight) {
 
   reportProgress(progressKey, 1, `Found ${segmentUrls.length} segments (${source})`);
 
-  const chunks = await downloadSegmentsWithProgress(segmentUrls, progressKey, 0, segmentUrls.length);
+  const chunks = await downloadSegmentsWithProgress(
+    segmentUrls, progressKey, 0, segmentUrls.length, isPrivate
+  );
 
   if (chunks.length === 0) {
     return { error: "All segment downloads failed" };
   }
 
+  const result = await writeSegmentsAsVideo(chunks, filename, progressKey, tabId);
+  result.segments = segmentUrls.length;
+
+  // A separate audio rendition cannot be muxed into the video stream here, so
+  // it is written as its own file instead of being appended to the video.
+  if (audioSegmentUrls.length > 0) {
+    const audio = await downloadAudioRendition(audioSegmentUrls, filename, progressKey, tabId);
+    if (audio) {
+      result.separateAudio = true;
+      result.audioFilename = audio.filename;
+    }
+  }
+
+  return result;
+}
+
+// Merge downloaded segments, remux to MP4, and hand the result to the browser.
+// Falls back to writing the raw transport stream when remuxing fails.
+async function writeSegmentsAsVideo(chunks, filename, progressKey, tabId) {
   const tsBlob = mergeChunks(chunks);
   const tsData = new Uint8Array(await tsBlob.arrayBuffer());
 
@@ -488,16 +557,32 @@ async function downloadStream(tabId, url, filename, qualityHeight) {
   try {
     reportProgress(progressKey, -1, "Remuxing to MP4...");
     const mp4Data = await transmuxTStoMP4(tsData);
-    const mp4Blob = new Blob([mp4Data], { type: "video/mp4" });
-    const mp4BlobUrl = URL.createObjectURL(mp4Blob);
-    const dlId = await browser.downloads.download({ url: mp4BlobUrl, filename: mp4Filename });
-    return { downloadId: dlId, segments: segmentUrls.length };
+    const mp4BlobUrl = URL.createObjectURL(new Blob([mp4Data], { type: "video/mp4" }));
+    const dlId = await startDownload({ url: mp4BlobUrl, filename: mp4Filename }, tabId);
+    return { downloadId: dlId, filename: mp4Filename };
   } catch {
     const tsBlobUrl = URL.createObjectURL(new Blob([tsData], { type: "video/mp2t" }));
     const tsFilename = mp4Filename.replace(/\.mp4$/, ".ts");
-    const dlId = await browser.downloads.download({ url: tsBlobUrl, filename: tsFilename });
-    return { downloadId: dlId, segments: segmentUrls.length, fallback: true };
+    const dlId = await startDownload({ url: tsBlobUrl, filename: tsFilename }, tabId);
+    return { downloadId: dlId, filename: tsFilename, fallback: true };
   }
+}
+
+async function downloadAudioRendition(audioSegmentUrls, filename, progressKey, tabId) {
+  reportProgress(progressKey, -1, "Downloading separate audio track...");
+
+  const chunks = await downloadSegmentsWithProgress(
+    audioSegmentUrls, progressKey, 0, audioSegmentUrls.length, isPrivateTab(tabId)
+  );
+  if (chunks.length === 0) return null;
+
+  const ext = /\.aac(\?|$)/i.test(audioSegmentUrls[0]) ? ".aac" : ".m4a";
+  const base = filename.replace(/\.(m3u8|mpd|ts|aac|m4a|mp4|ism).*$/i, "") || "audio";
+  const audioFilename = base + ".audio" + ext;
+
+  const blobUrl = URL.createObjectURL(mergeChunks(chunks));
+  await startDownload({ url: blobUrl, filename: audioFilename }, tabId);
+  return { filename: audioFilename };
 }
 
 function collectCapturedSegments(tabId, masterUrl) {
@@ -519,17 +604,19 @@ function collectCapturedSegments(tabId, masterUrl) {
   return allSegmentUrls;
 }
 
-async function getManifestSegments(m3u8Url, qualityHeight) {
+// Returns { video: [...], audio: [...] } — the audio list is only populated
+// when the manifest carries the audio as a rendition of its own.
+async function getManifestSegments(m3u8Url, qualityHeight, isPrivate) {
   try {
-    const parsed = await parseM3U8(m3u8Url);
-    if (!parsed) return [];
-    return await getSegmentsFromStoredManifest(parsed, qualityHeight);
+    const parsed = await parseM3U8(m3u8Url, isPrivate);
+    if (!parsed) return { video: [], audio: [] };
+    return await getSegmentsFromStoredManifest(parsed, qualityHeight, isPrivate);
   } catch {
-    return [];
+    return { video: [], audio: [] };
   }
 }
 
-async function getSegmentsFromStoredManifest(parsed, qualityHeight) {
+async function getSegmentsFromStoredManifest(parsed, qualityHeight, isPrivate) {
   let videoSegmentUrls = [];
   let audioSegmentUrls = [];
 
@@ -543,13 +630,13 @@ async function getSegmentsFromStoredManifest(parsed, qualityHeight) {
     }
 
     try {
-      const variantData = await parseM3U8(chosenVariant.url);
+      const variantData = await parseM3U8(chosenVariant.url, isPrivate);
       if (variantData) videoSegmentUrls = variantData.segments;
     } catch {}
 
     if (parsed.audioGroups && parsed.audioGroups.length > 0) {
       try {
-        const audioData = await parseM3U8(parsed.audioGroups[0].url);
+        const audioData = await parseM3U8(parsed.audioGroups[0].url, isPrivate);
         if (audioData) audioSegmentUrls = audioData.segments;
       } catch {}
     }
@@ -557,10 +644,10 @@ async function getSegmentsFromStoredManifest(parsed, qualityHeight) {
     videoSegmentUrls = parsed.segments;
   }
 
-  return [...videoSegmentUrls, ...audioSegmentUrls];
+  return { video: videoSegmentUrls, audio: audioSegmentUrls };
 }
 
-async function downloadSegmentsWithProgress(segmentUrls, progressKey, startIndex, totalSegments) {
+async function downloadSegmentsWithProgress(segmentUrls, progressKey, startIndex, totalSegments, isPrivate) {
   const chunks = [];
   let downloaded = 0;
   let failed = 0;
@@ -570,7 +657,7 @@ async function downloadSegmentsWithProgress(segmentUrls, progressKey, startIndex
     const batch = segmentUrls.slice(i, i + BATCH_SIZE);
     const results = await Promise.allSettled(
       batch.map((segUrl) =>
-        fetch(segUrl).then((resp) => {
+        mediaFetch(segUrl, isPrivate).then((resp) => {
           if (!resp.ok) throw new Error(resp.status);
           return resp.arrayBuffer();
         })
@@ -631,31 +718,17 @@ async function downloadConsolidatedStream(tabId, streamKey, filename) {
   }
 
   const progressKey = "stream://" + streamKey;
-  const chunks = await downloadSegmentsWithProgress(segmentUrls, progressKey, 0, segmentUrls.length);
+  const chunks = await downloadSegmentsWithProgress(
+    segmentUrls, progressKey, 0, segmentUrls.length, isPrivateTab(tabId)
+  );
 
   if (chunks.length === 0) {
     return { error: "All segment downloads failed" };
   }
 
-  const tsBlob = mergeChunks(chunks);
-  const tsData = new Uint8Array(await tsBlob.arrayBuffer());
-
-  let mp4Filename = filename.replace(/\.(ts|m3u8|aac|ism).*$/i, ".mp4");
-  if (!mp4Filename.endsWith(".mp4")) mp4Filename += ".mp4";
-
-  try {
-    reportProgress(progressKey, -1, "Remuxing to MP4...");
-    const mp4Data = await transmuxTStoMP4(tsData);
-    const mp4Blob = new Blob([mp4Data], { type: "video/mp4" });
-    const mp4BlobUrl = URL.createObjectURL(mp4Blob);
-    const dlId = await browser.downloads.download({ url: mp4BlobUrl, filename: mp4Filename });
-    return { downloadId: dlId, segments: segmentUrls.length };
-  } catch {
-    const tsBlobUrl = URL.createObjectURL(new Blob([tsData], { type: "video/mp2t" }));
-    const tsFilename = mp4Filename.replace(/\.mp4$/, ".ts");
-    const dlId = await browser.downloads.download({ url: tsBlobUrl, filename: tsFilename });
-    return { downloadId: dlId, segments: segmentUrls.length, fallback: true };
-  }
+  const result = await writeSegmentsAsVideo(chunks, filename, progressKey, tabId);
+  result.segments = segmentUrls.length;
+  return result;
 }
 
 function linkManifestToStreams(tabId, manifestUrl, parsed) {
@@ -691,11 +764,7 @@ async function processDownloadQueue() {
     try {
       await executeDownload(item);
     } catch (err) {
-      browser.runtime.sendMessage({
-        action: "download_error",
-        url: item.url,
-        error: err.message
-      }).catch(() => {});
+      notifyDownload(item.url, { state: "error", error: err.message });
     } finally {
       activeDownloads--;
       browser.runtime.sendMessage({
@@ -708,29 +777,55 @@ async function processDownloadQueue() {
   }
 }
 
+// The popup is told how a download ends through a message rather than through
+// the original sendResponse, which would otherwise stay open for minutes and
+// be dropped as soon as the popup is closed.
+function notifyDownload(url, payload) {
+  browser.runtime.sendMessage({ action: "dl_update", url, ...payload }).catch(() => {});
+}
+
+function reportDownloadResult(url, result) {
+  if (!result || result.error) {
+    notifyDownload(url, { state: "error", error: (result && result.error) || "Download failed" });
+    return;
+  }
+  notifyDownload(url, {
+    state: "done",
+    segments: result.segments || 0,
+    fallback: !!result.fallback,
+    separateAudio: !!result.separateAudio,
+    audioFilename: result.audioFilename || null
+  });
+}
+
 async function executeDownload(item) {
-  const { url, filename, tabId, quality, sendResponse: respond } = item;
+  const { url, filename, tabId, quality } = item;
 
   // Consolidated stream download
   if (url.startsWith("stream://")) {
     const streamKey = url.replace("stream://", "");
     const result = await downloadConsolidatedStream(tabId, streamKey, filename);
-    if (respond) respond(result);
+    reportDownloadResult(url, result);
     return result;
   }
 
   // HLS stream download
   if (/\.m3u8(\?|$)/i.test(url)) {
     const result = await downloadStream(tabId, url, filename, quality);
-    if (respond) respond(result);
+    reportDownloadResult(url, result);
     return result;
   }
 
-  // Regular download
-  const dlId = await browser.downloads.download({ url, filename });
-  const fileHash = getDomain(url) + "/" + (getFilenameFromUrl(url));
-  downloadedFiles.set(fileHash, { url, filename, timestamp: Date.now() });
-  if (respond) respond({ downloadId: dlId });
+  // Regular download — the browser owns the transfer from here, so the popup
+  // follows it by download id instead of waiting on us.
+  const dlId = await startDownload({ url, filename }, tabId);
+  // The duplicate log is shared across tabs and outlives the private window,
+  // so private downloads are deliberately left out of it.
+  if (!isPrivateTab(tabId)) {
+    const fileHash = getDomain(url) + "/" + (getFilenameFromUrl(url));
+    downloadedFiles.set(fileHash, { url, filename, timestamp: Date.now() });
+  }
+  notifyDownload(url, { state: "started", downloadId: dlId });
   return { downloadId: dlId };
 }
 
@@ -739,6 +834,8 @@ async function executeDownload(item) {
 browser.webRequest.onHeadersReceived.addListener(
   (details) => {
     if (details.tabId < 0) return;
+
+    markTabPrivacy(details.tabId, details.incognito);
 
     const url = details.url;
     let fileSize = null;
@@ -752,7 +849,7 @@ browser.webRequest.onHeadersReceived.addListener(
       }
     }
 
-    const segmentLike = isSegment(url, contentType);
+    const segmentLike = isSegment(url, contentType, fileSize);
 
     if (segmentLike) {
       addSegmentToStream(details.tabId, { url, size: fileSize, contentType });
@@ -776,7 +873,7 @@ browser.webRequest.onHeadersReceived.addListener(
 
       if (isManifest && fileSize && fileSize < 50000) {
         if (isM3U8) {
-          parseM3U8(url).then((parsed) => {
+          parseM3U8(url, details.incognito).then((parsed) => {
             if (!parsed) return;
             linkManifestToStreams(details.tabId, url, parsed);
           });
@@ -787,7 +884,7 @@ browser.webRequest.onHeadersReceived.addListener(
       if (/auth|token|drm|license|widevine|playready/i.test(url)) return;
 
       if (isM3U8) {
-        parseM3U8(url).then((parsed) => {
+        parseM3U8(url, details.incognito).then((parsed) => {
           if (!parsed) return;
 
           linkManifestToStreams(details.tabId, url, parsed);
@@ -851,6 +948,7 @@ browser.tabs.onRemoved.addListener((tabId) => {
   delete tabHLS[tabId];
   delete tabTitles[tabId];
   delete tabWatchMode[tabId];
+  delete tabPrivate[tabId];
 });
 
 browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -871,6 +969,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Content script found media
   if (message.action === "media_links") {
     const tabId = sender.tab ? sender.tab.id : null;
+    if (sender.tab) markTabPrivacy(sender.tab.id, sender.tab.incognito);
     if (tabId && message.links) {
       message.links.forEach((link) => {
         const mediaInfo = { ...link, source: link.source || "dom" };
@@ -889,6 +988,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => {
       if (tabs[0]) {
         const tabId = tabs[0].id;
+        markTabPrivacy(tabId, tabs[0].incognito);
         let media = tabMedia[tabId] ? Array.from(tabMedia[tabId].values()) : [];
         const pageTitle = tabTitles[tabId] || tabs[0].title || "";
 
@@ -949,24 +1049,15 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
           media,
           pageTitle,
           streams,
+          isPrivate: isPrivateTab(tabId),
           watchMode: !!tabWatchMode[tabId],
           queueLength: downloadQueue.length,
           activeDownloads
         });
       } else {
-        sendResponse({ media: [], pageTitle: "", streams: [], watchMode: false, queueLength: 0, activeDownloads: 0 });
+        sendResponse({ media: [], pageTitle: "", streams: [], isPrivate: false, watchMode: false, queueLength: 0, activeDownloads: 0 });
       }
     });
-    return true;
-  }
-
-  // Get all media across all tabs (for duplicate detection)
-  if (message.action === "get_all_tabs_media") {
-    const allTabsMedia = {};
-    for (const [tabId, mediaMap] of Object.entries(tabMedia)) {
-      allTabsMedia[tabId] = Array.from(mediaMap.values());
-    }
-    sendResponse({ allTabsMedia, downloadedFiles: Array.from(downloadedFiles.entries()) });
     return true;
   }
 
@@ -1018,9 +1109,10 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
         url: message.url,
         filename,
         tabId,
-        quality: message.quality,
-        sendResponse
+        quality: message.quality
       });
+
+      sendResponse({ queued: true, queueLength: downloadQueue.length });
     });
     return true;
   }
@@ -1067,11 +1159,4 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  // Get options
-  if (message.action === "get_options") {
-    browser.storage.local.get("options").then((result) => {
-      sendResponse(result.options || {});
-    });
-    return true;
-  }
 });
