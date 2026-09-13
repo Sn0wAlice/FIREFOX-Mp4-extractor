@@ -323,17 +323,8 @@
   <!-- Behavior settings -->
   <div class="section">
     <div class="section-title">Behavior</div>
-    <div class="toggle-row">
-      <div>
-        <div class="toggle-label">Network interception</div>
-        <div class="toggle-desc">Capture media from network requests (more thorough)</div>
-      </div>
-      <label class="toggle">
-        <input type="checkbox" id="networkIntercept" checked>
-        <span class="toggle-slider"></span>
-      </label>
-    </div>
-    <div class="toggle-row">
+
+<div class="toggle-row">
       <div>
         <div class="toggle-label">Deep DOM scan</div>
         <div class="toggle-desc">Scan inline scripts, data attributes, and iframes</div>
@@ -410,6 +401,17 @@
       </div>
       <label class="toggle">
         <input type="checkbox" id="showSource" checked>
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+
+    <div class="toggle-row">
+      <div>
+        <div class="toggle-label">Hide advertising</div>
+        <div class="toggle-desc">Keep pre-roll and mid-roll breaks out of the list. The popup says how many were hidden.</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="hideAds" checked>
         <span class="toggle-slider"></span>
       </label>
     </div>

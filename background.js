@@ -33,8 +33,75 @@ const tabPrivate = {};
 const tabPageUrl = {};
 // Download queue
 const downloadQueue = [];
+// Downloads the user asked to stop, keyed by the URL the popup shows
+const cancelled = new Set();
+
+function isCancelled(key) { return cancelled.has(key); }
+
+class DownloadCancelled extends Error {
+  constructor() { super("Cancelled"); this.cancelled = true; }
+}
+// How many advertising items were hidden, per tab
+const adsHidden = {};
+// Tabs whose player streams through Media Source Extensions
+const tabUsesMediaSource = {};
 let activeDownloads = 0;
 let maxConcurrentDownloads = 2;
+
+// ── Options ──
+// The badge and the format filter are decided on the hot path of every
+// request, so the stored options are mirrored here rather than read each time.
+
+let currentOptions = {};
+
+function refreshOptions() {
+  return browser.storage.local.get("options").then((result) => {
+    currentOptions = result.options || {};
+    return currentOptions;
+  });
+}
+
+refreshOptions();
+browser.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.options) currentOptions = changes.options.newValue || {};
+});
+
+// ── What counts as downloadable media ──
+
+// A page that streams through Media Source Extensions gives its <video> a
+// blob: URL. It is a handle on a buffer the page filled itself, not something
+// that can be fetched or downloaded, so it never belongs in the list — the
+// real stream is the one passing through the network layer.
+function isFetchableUrl(url) {
+  return typeof url === "string" && /^https?:\/\//i.test(url);
+}
+
+// Advertising is served by a handful of well-known networks and through a few
+// unmistakable path markers. Anything matched here is counted and hidden
+// rather than dropped silently, so a false positive stays visible.
+const AD_HOSTS = /(^|\.)(doubleclick\.net|googlesyndication\.com|2mdn\.net|imasdk\.googleapis\.com|adservice\.google\.[a-z.]+|smartadserver\.com|sascdn\.com|freewheel\.tv|fwmrm\.net|innovid\.com|teads\.tv|spotxchange\.com|spotx\.tv|adsafeprotected\.com|moatads\.com|serving-sys\.com|adnxs\.com|casalemedia\.com|criteo\.(com|net)|taboola\.com|outbrain\.com)$/i;
+const AD_PATHS = /\/(ads?|advert\w*|preroll|midroll|postroll|adbreak|ad_break|vast|vmap|creatives?)\//i;
+
+// The format list in the options page decides what is worth listing at all.
+function isEnabledFormat(url, formats) {
+  if (!formats || formats.length === 0) return true;
+  const ext = (url.split("?")[0].split(".").pop() || "").toLowerCase();
+  if (!ext || ext.length > 5) return true; // no extension to judge by
+  const known = ["mp4", "webm", "mkv", "avi", "mov", "ts", "m3u8", "mpd", "mp3", "m4a", "ogg", "wav", "flac"];
+  if (!known.includes(ext)) return true;
+  return formats.includes(ext);
+}
+
+function isAdvertising(url) {
+  try {
+    const u = new URL(url);
+    if (AD_HOSTS.test(u.hostname)) return true;
+    if (AD_PATHS.test(u.pathname)) return true;
+    return /[?&](ad_?type|adtag|slotid|vast|vmap)=/i.test(u.search);
+  } catch {
+    return false;
+  }
+}
 
 // ── Utility ──
 
@@ -186,6 +253,40 @@ async function mediaFetch(url, ctx, range) {
 // segment at the same URL and distinguish them only by the slice they cover, so
 // a segment can never be reduced to its URL.
 
+// #EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x...
+// A key served in the clear alongside the playlist is transport encryption,
+// part of the HLS specification, and every conforming player decrypts it.
+// Anything that needs a licence server is a different matter and is left alone.
+function parseKeyLine(value, baseUrl) {
+  const method = (value.match(/METHOD=([A-Z0-9-]+)/i) || [])[1] || "NONE";
+  if (method === "NONE") return null;
+
+  const uri = (value.match(/URI="([^"]+)"/) || [])[1];
+  if (!uri) return null;
+
+  const ivHex = (value.match(/IV=0x([0-9a-f]+)/i) || [])[1] || null;
+  return { method: method.toUpperCase(), url: resolveUrl(uri, baseUrl), ivHex };
+}
+
+// #EXT-X-MAP:URI="init.mp4",BYTERANGE="719@0"
+function parseMapLine(value, baseUrl) {
+  const uri = (value.match(/URI="([^"]+)"/) || [])[1];
+  if (!uri) return null;
+
+  const segment = { url: resolveUrl(uri, baseUrl) };
+  if (!segment.url) return null;
+
+  const rangeText = (value.match(/BYTERANGE="([^"]+)"/) || [])[1];
+  if (rangeText) {
+    const range = parseByteRange(rangeText);
+    if (range) {
+      segment.start = range.offset === null ? 0 : range.offset;
+      segment.length = range.length;
+    }
+  }
+  return segment;
+}
+
 function parseByteRange(value) {
   const [lenPart, offsetPart] = value.trim().split("@");
   const length = parseInt(lenPart, 10);
@@ -304,6 +405,12 @@ function detectStreamType(segments) {
 }
 
 function addSegmentToStream(tabId, segmentInfo) {
+  // An ad break is its own little stream; letting its segments through would
+  // create a phantom entry next to the real one.
+  if (isAdvertising(segmentInfo.url)) {
+    adsHidden[tabId] = (adsHidden[tabId] || 0) + 1;
+    return;
+  }
   if (!tabStreams[tabId]) tabStreams[tabId] = new Map();
 
   const key = getStreamKey(segmentInfo.url);
@@ -378,12 +485,20 @@ function updateStreamEntry(tabId, key, stream) {
 // ── Regular media (non-segment) ──
 
 function addMediaToTab(tabId, mediaInfo) {
+  if (!isFetchableUrl(mediaInfo.url)) return;
   if (!tabMedia[tabId]) tabMedia[tabId] = new Map();
 
   browser.storage.local.get("options").then((result) => {
     const opts = result.options || {};
     const blacklist = opts.blacklist || [];
     if (isBlacklisted(mediaInfo.url, blacklist)) return;
+
+    if (opts.hideAds !== false && isAdvertising(mediaInfo.url)) {
+      adsHidden[tabId] = (adsHidden[tabId] || 0) + 1;
+      return;
+    }
+
+    if (!isEnabledFormat(mediaInfo.url, opts.formats)) return;
 
     if (mediaInfo.size) {
       if (opts.minSize && mediaInfo.size < opts.minSize * 1024) return;
@@ -445,7 +560,7 @@ function notifyWatchMode(tabId, media) {
 
 function updateBadge(tabId) {
   const count = tabMedia[tabId] ? tabMedia[tabId].size : 0;
-  const text = count > 0 ? String(count) : "";
+  const text = currentOptions.showBadge === false ? "" : (count > 0 ? String(count) : "");
   browser.browserAction.setBadgeText({ text, tabId });
   browser.browserAction.setBadgeBackgroundColor({ color: count > 0 ? "#7c3aed" : "#666", tabId });
 }
@@ -457,26 +572,36 @@ async function parseM3U8(url, ctx) {
     const resp = await mediaFetch(url, ctx);
     const text = await resp.text();
     const lines = text.split("\n").map((l) => l.trim());
-    const result = { masterUrl: url, variants: [], segments: [], audioGroups: [], totalDuration: 0 };
+    const result = {
+      masterUrl: url, variants: [], segments: [],
+      audioGroups: [], subtitleGroups: [], totalDuration: 0
+    };
 
     const isMaster = lines.some((l) => l.startsWith("#EXT-X-STREAM-INF"));
 
     if (isMaster) {
       for (let i = 0; i < lines.length; i++) {
-        if (lines[i].startsWith("#EXT-X-MEDIA") && lines[i].includes("TYPE=AUDIO")) {
-          const uriMatch = lines[i].match(/URI="([^"]+)"/);
-          const nameMatch = lines[i].match(/NAME="([^"]+)"/);
-          const langMatch = lines[i].match(/LANGUAGE="([^"]+)"/);
-          if (uriMatch) {
-            const audioUrl = resolveUrl(uriMatch[1], url);
-            if (!audioUrl) continue;
-            result.audioGroups.push({
-              url: audioUrl,
-              name: nameMatch ? nameMatch[1] : "audio",
-              language: langMatch ? langMatch[1] : null
-            });
-          }
-        }
+        if (!lines[i].startsWith("#EXT-X-MEDIA")) continue;
+
+        const isAudio = lines[i].includes("TYPE=AUDIO");
+        const isSubtitles = lines[i].includes("TYPE=SUBTITLES");
+        if (!isAudio && !isSubtitles) continue;
+
+        const uriMatch = lines[i].match(/URI="([^"]+)"/);
+        if (!uriMatch) continue;
+        const mediaUrl = resolveUrl(uriMatch[1], url);
+        if (!mediaUrl) continue;
+
+        const nameMatch = lines[i].match(/NAME="([^"]+)"/);
+        const langMatch = lines[i].match(/LANGUAGE="([^"]+)"/);
+        const rendition = {
+          url: mediaUrl,
+          name: nameMatch ? nameMatch[1] : (isAudio ? "audio" : "subtitles"),
+          language: langMatch ? langMatch[1] : null
+        };
+
+        if (isAudio) result.audioGroups.push(rendition);
+        else result.subtitleGroups.push(rendition);
       }
 
       for (let i = 0; i < lines.length; i++) {
@@ -505,8 +630,15 @@ async function parseM3U8(url, ctx) {
       // #EXT-X-BYTERANGE may omit the offset, which then means "straight after
       // the previous sub-range of the same resource".
       const nextOffset = new Map();
+      // The key in force applies to every segment until another one is declared.
+      let currentKey = null;
+      let sequence = 0;
 
       for (const line of lines) {
+        if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
+          sequence = parseInt(line.split(":")[1], 10) || 0;
+          continue;
+        }
         if (line.startsWith("#EXTINF:")) {
           const dur = parseFloat(line.split(":")[1]);
           if (!isNaN(dur)) duration += dur;
@@ -514,6 +646,16 @@ async function parseM3U8(url, ctx) {
         }
         if (line.startsWith("#EXT-X-BYTERANGE:")) {
           pendingRange = parseByteRange(line.slice("#EXT-X-BYTERANGE:".length));
+          continue;
+        }
+        if (line.startsWith("#EXT-X-KEY:")) {
+          currentKey = parseKeyLine(line.slice("#EXT-X-KEY:".length), url);
+          continue;
+        }
+        // The initialisation segment of a fragmented MP4 stream: it carries
+        // ftyp and moov, without which the media segments mean nothing.
+        if (line.startsWith("#EXT-X-MAP:")) {
+          result.initSegment = parseMapLine(line.slice("#EXT-X-MAP:".length), url);
           continue;
         }
         if (!line || line.startsWith("#")) continue;
@@ -524,6 +666,12 @@ async function parseM3U8(url, ctx) {
         if (!segUrl) continue;
 
         const segment = { url: segUrl };
+        if (currentKey) {
+          segment.key = currentKey;
+          // AES-128 defaults the initialisation vector to the media sequence
+          // number of the segment when the playlist does not give one.
+          segment.mediaSequence = sequence + result.segments.length;
+        }
         if (range) {
           const start = range.offset === null ? (nextOffset.get(segUrl) || 0) : range.offset;
           segment.start = start;
@@ -539,6 +687,193 @@ async function parseM3U8(url, ctx) {
   } catch {
     return null;
   }
+}
+
+// ── MPEG-DASH ──
+// An MPD describes each track as a template to expand rather than a list of
+// URLs. Two shapes cover nearly every stream in the wild: a fixed segment
+// duration with a numbered template, and an explicit SegmentTimeline. Both are
+// handled here; the segments themselves are fragmented MP4, which the rest of
+// the pipeline already knows how to assemble.
+
+function parseIsoDuration(value) {
+  if (!value) return 0;
+  const m = value.match(/^P(?:([\d.]+)Y)?(?:([\d.]+)M)?(?:([\d.]+)D)?(?:T(?:([\d.]+)H)?(?:([\d.]+)M)?(?:([\d.]+)S)?)?$/);
+  if (!m) return 0;
+  const [, y, mo, d, h, mi, sec] = m.map((x) => (x === undefined ? 0 : parseFloat(x)));
+  return ((y * 365 + mo * 30 + d) * 24 + h) * 3600 + mi * 60 + sec;
+}
+
+// BaseURL may appear at every level and each one resolves against the one above.
+function resolveBaseUrl(element, documentUrl) {
+  const chain = [];
+  for (let node = element; node && node.nodeType === 1; node = node.parentNode) {
+    const own = Array.from(node.children || []).find((c) => c.nodeName === "BaseURL");
+    if (own && own.textContent.trim()) chain.unshift(own.textContent.trim());
+  }
+  return chain.reduce((base, part) => resolveUrl(part, base) || base, documentUrl);
+}
+
+function expandTemplate(template, values) {
+  return template.replace(/\$(RepresentationID|Number|Bandwidth|Time)(?:%0(\d+)d)?\$/g, (whole, name, width) => {
+    const value = values[name];
+    if (value === undefined || value === null) return whole;
+    const text = String(value);
+    return width ? text.padStart(parseInt(width, 10), "0") : text;
+  }).replace(/\$\$/g, "$");
+}
+
+function firstChild(element, name) {
+  return Array.from(element.children || []).find((c) => c.nodeName === name) || null;
+}
+
+// Expands one SegmentTemplate into the ordered list of segments of a track.
+function segmentsFromTemplate(template, representation, baseUrl, totalDuration) {
+  const media = template.getAttribute("media");
+  if (!media) return [];
+
+  const values = {
+    RepresentationID: representation.getAttribute("id"),
+    Bandwidth: representation.getAttribute("bandwidth")
+  };
+  const segments = [];
+
+  const initTemplate = template.getAttribute("initialization");
+  if (initTemplate) {
+    const initUrl = resolveUrl(expandTemplate(initTemplate, values), baseUrl);
+    if (initUrl) segments.push({ url: initUrl });
+  }
+
+  const timescale = parseFloat(template.getAttribute("timescale")) || 1;
+  const startNumber = parseInt(template.getAttribute("startNumber"), 10);
+  let number = Number.isFinite(startNumber) ? startNumber : 1;
+
+  const timeline = firstChild(template, "SegmentTimeline");
+  if (timeline) {
+    let time = 0;
+    for (const entry of Array.from(timeline.children)) {
+      if (entry.nodeName !== "S") continue;
+      const t = parseFloat(entry.getAttribute("t"));
+      if (Number.isFinite(t)) time = t;
+      const d = parseFloat(entry.getAttribute("d")) || 0;
+      const repeat = parseInt(entry.getAttribute("r"), 10) || 0;
+
+      for (let i = 0; i <= repeat; i++) {
+        const url = resolveUrl(expandTemplate(media, { ...values, Number: number, Time: time }), baseUrl);
+        if (url) segments.push({ url });
+        time += d;
+        number++;
+      }
+    }
+    return segments;
+  }
+
+  const segmentDuration = parseFloat(template.getAttribute("duration"));
+  if (!segmentDuration || !totalDuration) return segments;
+
+  const count = Math.ceil(totalDuration / (segmentDuration / timescale));
+  for (let i = 0; i < count; i++) {
+    const url = resolveUrl(expandTemplate(media, { ...values, Number: number + i, Time: i * segmentDuration }), baseUrl);
+    if (url) segments.push({ url });
+  }
+  return segments;
+}
+
+// A SegmentList spells every segment out instead of templating them.
+function segmentsFromList(list, baseUrl) {
+  const segments = [];
+  const init = firstChild(list, "Initialization");
+  if (init && init.getAttribute("sourceURL")) {
+    const url = resolveUrl(init.getAttribute("sourceURL"), baseUrl);
+    if (url) segments.push({ url });
+  }
+  for (const entry of Array.from(list.children)) {
+    if (entry.nodeName !== "SegmentURL") continue;
+    const url = resolveUrl(entry.getAttribute("media") || "", baseUrl);
+    if (url) segments.push({ url });
+  }
+  return segments;
+}
+
+function representationTrack(representation, adaptationSet, documentUrl, totalDuration) {
+  const baseUrl = resolveBaseUrl(representation, documentUrl);
+  const template = firstChild(representation, "SegmentTemplate") || firstChild(adaptationSet, "SegmentTemplate");
+  const list = firstChild(representation, "SegmentList") || firstChild(adaptationSet, "SegmentList");
+
+  let segments = [];
+  if (template) segments = segmentsFromTemplate(template, representation, baseUrl, totalDuration);
+  else if (list) segments = segmentsFromList(list, baseUrl);
+  else {
+    // No template and no list: the representation is one plain file.
+    const own = firstChild(representation, "BaseURL");
+    if (own) segments = [{ url: baseUrl }];
+  }
+
+  return {
+    id: representation.getAttribute("id"),
+    bandwidth: parseInt(representation.getAttribute("bandwidth"), 10) || 0,
+    width: parseInt(representation.getAttribute("width"), 10) || 0,
+    height: parseInt(representation.getAttribute("height"), 10) || 0,
+    segments
+  };
+}
+
+async function parseMPD(url, ctx) {
+  try {
+    const resp = await mediaFetch(url, ctx);
+    if (!resp.ok) return null;
+
+    const doc = new DOMParser().parseFromString(await resp.text(), "application/xml");
+    const mpd = doc.documentElement;
+    if (!mpd || mpd.nodeName === "parsererror" || mpd.nodeName !== "MPD") return null;
+
+    const totalDuration = parseIsoDuration(mpd.getAttribute("mediaPresentationDuration"));
+    const period = doc.getElementsByTagName("Period")[0];
+    if (!period) return null;
+
+    const result = { manifestUrl: url, video: [], audio: [], totalDuration, isDash: true };
+
+    for (const set of Array.from(period.children)) {
+      if (set.nodeName !== "AdaptationSet") continue;
+
+      const mime = set.getAttribute("mimeType") || "";
+      const kind = set.getAttribute("contentType") || mime.split("/")[0];
+      if (kind !== "video" && kind !== "audio") continue;
+
+      for (const representation of Array.from(set.children)) {
+        if (representation.nodeName !== "Representation") continue;
+        const track = representationTrack(representation, set, url, totalDuration);
+        if (track.segments.length > 0) result[kind].push(track);
+      }
+    }
+
+    if (result.video.length === 0 && result.audio.length === 0) return null;
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+// Picks the requested height, or the richest track otherwise, and returns the
+// same shape the HLS side produces.
+function dashSegments(parsed, qualityHeight) {
+  const byQuality = (tracks) => {
+    if (tracks.length === 0) return null;
+    const wanted = qualityHeight && tracks.find((t) => t.height === qualityHeight);
+    return wanted || tracks.slice().sort((a, b) => b.bandwidth - a.bandwidth)[0];
+  };
+
+  const video = byQuality(parsed.video);
+  const audio = byQuality(parsed.audio);
+
+  return {
+    video: video ? video.segments : [],
+    // DASH always keeps audio in its own track, so it is written as its own file.
+    audio: video && audio ? audio.segments : (audio ? audio.segments : []),
+    subtitles: [],
+    duration: parsed.totalDuration || 0,
+    fragmentedMp4: true
+  };
 }
 
 // ── TS → MP4 Transmuxing via mux.js ──
@@ -592,17 +927,24 @@ async function downloadStream(tabId, url, filename, qualityHeight, progressKey =
   let manifest = null;
   if (/\.m3u8(\?|$)/i.test(url)) {
     manifest = await getManifestSegments(url, qualityHeight, ctx);
+  } else if (/\.mpd(\?|$)/i.test(url)) {
+    const mpd = await parseMPD(url, ctx);
+    if (mpd) manifest = dashSegments(mpd, qualityHeight);
   }
 
   let segmentUrls = [];
   let audioSegmentUrls = [];
   let playlistDuration = 0;
+  let fragmentedMp4 = false;
+  let subtitleTracks = [];
   let source = "";
 
   if (manifest && manifest.video.length > 0) {
     segmentUrls = manifest.video;
     audioSegmentUrls = manifest.audio;
     playlistDuration = manifest.duration || 0;
+    fragmentedMp4 = !!manifest.fragmentedMp4;
+    subtitleTracks = manifest.subtitles || [];
     source = "manifest";
   } else if (capturedSegments.length > 0) {
     segmentUrls = capturedSegments;
@@ -614,6 +956,8 @@ async function downloadStream(tabId, url, filename, qualityHeight, progressKey =
       segmentUrls = stored.video;
       audioSegmentUrls = stored.audio;
       playlistDuration = stored.duration || 0;
+      fragmentedMp4 = !!stored.fragmentedMp4;
+      subtitleTracks = stored.subtitles || [];
       source = "stored";
     }
   }
@@ -631,7 +975,9 @@ async function downloadStream(tabId, url, filename, qualityHeight, progressKey =
   const incomplete = segmentFailureError(video, segmentUrls.length, ctx);
   if (incomplete) return incomplete;
 
-  const result = await writeSegmentsAsVideo(video.chunks, filename, progressKey, tabId, playlistDuration);
+  const result = await writeSegmentsAsVideo(
+    video.chunks, filename, progressKey, tabId, playlistDuration, fragmentedMp4
+  );
   result.segments = segmentUrls.length;
 
   // A separate audio rendition cannot be muxed into the video stream here, so
@@ -642,6 +988,18 @@ async function downloadStream(tabId, url, filename, qualityHeight, progressKey =
       result.separateAudio = true;
       result.audioFilename = audio.filename;
     }
+  }
+
+  if (subtitleTracks.length > 0) {
+    reportProgress(progressKey, -1, "Downloading subtitles...");
+    const written = [];
+    for (let i = 0; i < subtitleTracks.length; i++) {
+      try {
+        const name = await downloadSubtitleTrack(subtitleTracks[i], filename, tabId, ctx, i);
+        if (name) written.push(name);
+      } catch {}
+    }
+    if (written.length > 0) result.subtitles = written;
   }
 
   return result;
@@ -1270,16 +1628,23 @@ function fragmentedToProgressiveMp4(bytes) {
 
 // Merge downloaded segments, remux to MP4, and hand the result to the browser.
 // Falls back to writing the raw transport stream when remuxing fails.
-async function writeSegmentsAsVideo(chunks, filename, progressKey, tabId, knownDuration) {
-  const tsBlob = mergeChunks(chunks);
-  const tsData = new Uint8Array(await tsBlob.arrayBuffer());
+async function writeSegmentsAsVideo(chunks, filename, progressKey, tabId, knownDuration, fragmentedMp4) {
+  let source = mergeChunks(chunks);
+  chunks.length = 0; // the merged copy is the only one needed from here
 
-  let mp4Filename = filename.replace(/\.(m3u8|mpd|ts|aac|ism).*$/i, ".mp4");
+  let mp4Filename = filename.replace(/\.(m3u8|mpd|ts|aac|m4s|ism).*$/i, ".mp4");
   if (!mp4Filename.endsWith(".mp4")) mp4Filename += ".mp4";
 
   try {
-    reportProgress(progressKey, -1, "Remuxing to MP4...");
-    const fragmented = await transmuxTStoMP4(tsData);
+    let fragmented;
+    if (fragmentedMp4) {
+      // Already a fragmented MP4: the segments only need the sample tables.
+      reportProgress(progressKey, -1, "Rebuilding MP4 index...");
+      fragmented = source;
+    } else {
+      reportProgress(progressKey, -1, "Remuxing to MP4...");
+      fragmented = await transmuxTStoMP4(source);
+    }
 
     // A fragmented MP4 opens as an empty movie in VLC and QuickTime, so the
     // file is rewritten with real sample tables before it is handed over.
@@ -1287,16 +1652,22 @@ async function writeSegmentsAsVideo(chunks, filename, progressKey, tabId, knownD
     if (!mp4Data) {
       mp4Data = fragmented;
       repairFragmentedMp4Duration(mp4Data, knownDuration);
+    } else if (fragmented !== source) {
+      fragmented = null;
     }
+    source = null;
 
     const mp4BlobUrl = URL.createObjectURL(new Blob([mp4Data], { type: "video/mp4" }));
     const dlId = await startDownload({ url: mp4BlobUrl, filename: mp4Filename }, tabId);
     return { downloadId: dlId, filename: mp4Filename };
-  } catch {
-    const tsBlobUrl = URL.createObjectURL(new Blob([tsData], { type: "video/mp2t" }));
-    const tsFilename = mp4Filename.replace(/\.mp4$/, ".ts");
-    const dlId = await startDownload({ url: tsBlobUrl, filename: tsFilename }, tabId);
-    return { downloadId: dlId, filename: tsFilename, fallback: true };
+  } catch (err) {
+    if (err && err.cancelled) throw err;
+    if (!source) throw err;
+
+    const rawFilename = mp4Filename.replace(/\.mp4$/, fragmentedMp4 ? ".m4s" : ".ts");
+    const rawUrl = URL.createObjectURL(new Blob([source], { type: fragmentedMp4 ? "video/mp4" : "video/mp2t" }));
+    const dlId = await startDownload({ url: rawUrl, filename: rawFilename }, tabId);
+    return { downloadId: dlId, filename: rawFilename, fallback: true };
   }
 }
 
@@ -1312,7 +1683,7 @@ async function downloadAudioRendition(audioSegmentUrls, filename, progressKey, t
   const base = filename.replace(/\.(m3u8|mpd|ts|aac|m4a|mp4|ism).*$/i, "") || "audio";
   const audioFilename = base + ".audio" + ext;
 
-  const blobUrl = URL.createObjectURL(mergeChunks(chunks));
+  const blobUrl = URL.createObjectURL(new Blob([mergeChunks(chunks)]));
   await startDownload({ url: blobUrl, filename: audioFilename }, tabId);
   return { filename: audioFilename };
 }
@@ -1390,7 +1761,7 @@ async function getSegmentsFromStoredManifest(parsed, qualityHeight, ctx) {
     try {
       const variantData = await parseM3U8(chosenVariant.url, ctx);
       if (variantData) {
-        videoSegmentUrls = variantData.segments;
+        videoSegmentUrls = withInitSegment(variantData);
         duration = variantData.totalDuration || 0;
       }
     } catch {}
@@ -1398,50 +1769,186 @@ async function getSegmentsFromStoredManifest(parsed, qualityHeight, ctx) {
     if (parsed.audioGroups && parsed.audioGroups.length > 0) {
       try {
         const audioData = await parseM3U8(parsed.audioGroups[0].url, ctx);
-        if (audioData) audioSegmentUrls = audioData.segments;
+        if (audioData) audioSegmentUrls = withInitSegment(audioData);
       } catch {}
     }
   } else if (parsed.segments) {
-    videoSegmentUrls = parsed.segments;
+    videoSegmentUrls = withInitSegment(parsed);
     duration = parsed.totalDuration || 0;
   }
 
-  return { video: videoSegmentUrls, audio: audioSegmentUrls, duration };
+  return {
+    video: videoSegmentUrls,
+    audio: audioSegmentUrls,
+    subtitles: parsed.subtitleGroups || [],
+    duration,
+    fragmentedMp4: isFragmentedMp4Playlist(videoSegmentUrls)
+  };
+}
+
+// ── Subtitles ──
+// Each rendition is a playlist of WebVTT segments. They carry timestamps on
+// the media timeline already, so the segments only need their repeated headers
+// stripped before being joined into one file.
+
+function mergeWebVtt(parts) {
+  const cues = [];
+  for (const part of parts) {
+    const body = part
+      .replace(/^\uFEFF/, "")
+      .replace(/^WEBVTT[^\n]*\n/, "")
+      .replace(/^X-TIMESTAMP-MAP[^\n]*\n/m, "")
+      .trim();
+    if (body) cues.push(body);
+  }
+  return "WEBVTT\n\n" + cues.join("\n\n") + "\n";
+}
+
+async function downloadSubtitleTrack(rendition, filename, tabId, ctx, index) {
+  const playlist = await parseM3U8(rendition.url, ctx);
+  if (!playlist || playlist.segments.length === 0) return null;
+
+  const parts = [];
+  for (const segment of playlist.segments) {
+    try {
+      const resp = await mediaFetch(segment.url, ctx, segmentRange(segment));
+      if (resp.ok) parts.push(await resp.text());
+    } catch {}
+  }
+  if (parts.length === 0) return null;
+
+  const tag = (rendition.language || rendition.name || String(index + 1))
+    .replace(/[^\w-]/g, "").slice(0, 16) || String(index + 1);
+  const base = filename.replace(/\.(m3u8|mpd|ts|m4s|aac|m4a|mp4|ism).*$/i, "") || "subtitles";
+  const subFilename = `${base}.${tag}.vtt`;
+
+  const blobUrl = URL.createObjectURL(new Blob([mergeWebVtt(parts)], { type: "text/vtt" }));
+  await startDownload({ url: blobUrl, filename: subFilename }, tabId);
+  return subFilename;
+}
+
+// The initialisation segment carries ftyp and moov. Put in front of the media
+// segments it forms a valid fragmented MP4 on its own, which is exactly what
+// the progressive rewriter already knows how to handle.
+function withInitSegment(parsed) {
+  if (!parsed.initSegment) return parsed.segments;
+  return [parsed.initSegment, ...parsed.segments];
+}
+
+// mux.js only demultiplexes MPEG-2 transport streams. A CMAF playlist has to
+// skip it entirely, otherwise it produces nothing and the download silently
+// falls back to an unplayable .ts.
+function isFragmentedMp4Playlist(segments) {
+  if (segments.length === 0) return false;
+  return segments.some((s) => /\.(m4s|m4f|mp4|cmfv|cmfa|fmp4)(\?|$)/i.test(s.url));
+}
+
+// ── AES-128 ──
+// Keys are small and shared by every segment of a playlist, so each one is
+// fetched once and kept for the duration of the download.
+const keyCache = new Map();
+
+async function importAesKey(key, ctx) {
+  if (keyCache.has(key.url)) return keyCache.get(key.url);
+
+  const pending = (async () => {
+    const resp = await mediaFetch(key.url, ctx);
+    if (!resp.ok) throw new Error("Key fetch failed: HTTP " + resp.status);
+    const raw = await resp.arrayBuffer();
+    if (raw.byteLength !== 16) throw new Error("Unexpected AES-128 key length");
+    return crypto.subtle.importKey("raw", raw, { name: "AES-CBC" }, false, ["decrypt"]);
+  })();
+
+  keyCache.set(key.url, pending);
+  return pending;
+}
+
+// Absent an explicit IV, the HLS specification uses the segment's media
+// sequence number as a big-endian 128-bit integer.
+function initialisationVector(key, mediaSequence) {
+  const iv = new Uint8Array(16);
+  if (key.ivHex) {
+    const hex = key.ivHex.padStart(32, "0").slice(-32);
+    for (let i = 0; i < 16; i++) iv[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return iv;
+  }
+  const view = new DataView(iv.buffer);
+  view.setUint32(12, mediaSequence >>> 0);
+  return iv;
+}
+
+async function decryptSegment(buffer, segment, ctx) {
+  if (segment.key.method !== "AES-128") {
+    throw new Error(`${segment.key.method} needs a licence server — not supported`);
+  }
+  const key = await importAesKey(segment.key, ctx);
+  const iv = initialisationVector(segment.key, segment.mediaSequence || 0);
+  return crypto.subtle.decrypt({ name: "AES-CBC", iv }, key, buffer);
+}
+
+const SEGMENT_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 400;
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// A CDN under load drops the odd segment, and refusing to write an incomplete
+// file means one such drop used to throw away the whole download. Each segment
+// gets a few spaced-out attempts before it counts as lost.
+async function fetchSegment(segment, ctx, progressKey) {
+  const range = segmentRange(segment);
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= SEGMENT_ATTEMPTS; attempt++) {
+    if (isCancelled(progressKey)) throw new DownloadCancelled();
+    try {
+      const resp = await mediaFetch(segment.url, ctx, range);
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+
+      const body = sliceRangeResponse(await resp.arrayBuffer(), resp.status, range);
+      return segment.key ? decryptSegment(body, segment, ctx) : body;
+    } catch (err) {
+      if (err.cancelled) throw err;
+      lastError = err;
+      if (attempt < SEGMENT_ATTEMPTS) await wait(RETRY_DELAY_MS * attempt);
+    }
+  }
+  throw lastError;
 }
 
 async function downloadSegmentsWithProgress(segments, progressKey, startIndex, totalSegments, ctx) {
   const chunks = [];
   let downloaded = 0;
   let failed = 0;
+  let retried = 0;
   const BATCH_SIZE = 6;
 
   for (let i = 0; i < segments.length; i += BATCH_SIZE) {
+    if (isCancelled(progressKey)) throw new DownloadCancelled();
+
     const batch = segments.slice(i, i + BATCH_SIZE);
     const results = await Promise.allSettled(
-      batch.map((segment) => {
-        const range = segmentRange(segment);
-        return mediaFetch(segment.url, ctx, range).then(async (resp) => {
-          if (!resp.ok) throw new Error(resp.status);
-          return sliceRangeResponse(await resp.arrayBuffer(), resp.status, range);
-        });
-      })
+      batch.map((segment) => fetchSegment(segment, ctx, progressKey))
     );
 
-    results.forEach((result) => {
+    for (const result of results) {
       if (result.status === "fulfilled") {
         chunks.push(result.value);
+      } else if (result.reason && result.reason.cancelled) {
+        throw new DownloadCancelled();
       } else {
         failed++;
       }
       downloaded++;
-    });
+    }
 
     const globalProgress = ((startIndex + downloaded) / totalSegments) * 90;
-    const failText = failed > 0 ? ` (${failed} failed)` : "";
+    const failText = failed > 0 ? ` (${failed} lost)` : "";
     reportProgress(progressKey, globalProgress, `${startIndex + downloaded}/${totalSegments}${failText}`);
   }
 
-  return { chunks, failed };
+  return { chunks, failed, retried };
 }
 
 function reportProgress(url, progress, label) {
@@ -1453,6 +1960,8 @@ function reportProgress(url, progress, label) {
   }).catch(() => {});
 }
 
+// Returns the bytes, not a Blob: wrapping them and reading them back doubled
+// the peak memory of every download for nothing.
 function mergeChunks(chunks) {
   const totalSize = chunks.reduce((s, c) => s + c.byteLength, 0);
   const merged = new Uint8Array(totalSize);
@@ -1461,7 +1970,7 @@ function mergeChunks(chunks) {
     merged.set(new Uint8Array(chunk), offset);
     offset += chunk.byteLength;
   }
-  return new Blob([merged]);
+  return merged;
 }
 
 // Download a consolidated auto-detected stream
@@ -1490,7 +1999,9 @@ async function downloadConsolidatedStream(tabId, streamKey, filename) {
   const incomplete = segmentFailureError(video, segmentUrls.length, ctx);
   if (incomplete) return incomplete;
 
-  const result = await writeSegmentsAsVideo(video.chunks, filename, progressKey, tabId);
+  const result = await writeSegmentsAsVideo(
+    video.chunks, filename, progressKey, tabId, 0, isFragmentedMp4Playlist(segmentUrls)
+  );
   result.segments = segmentUrls.length;
   return result;
 }
@@ -1504,6 +2015,20 @@ function linkManifestToStreams(tabId, manifestUrl, parsed) {
       stream.parsedManifest = parsed;
     }
   }
+}
+
+// ── Clearing ──
+// A single page application never reloads, so a tab keeps accumulating the
+// media of every video watched in it. Clearing has to be something the user
+// can ask for.
+
+function clearTabMedia(tabId) {
+  delete tabMedia[tabId];
+  delete tabStreams[tabId];
+  delete tabHLS[tabId];
+  delete adsHidden[tabId];
+  delete tabUsesMediaSource[tabId];
+  updateBadge(tabId);
 }
 
 // ── Download queue management ──
@@ -1526,10 +2051,16 @@ async function processDownloadQueue() {
     }).catch(() => {});
 
     try {
-      await executeDownload(item);
+      if (isCancelled(item.url)) {
+        notifyDownload(item.url, { state: "cancelled" });
+      } else {
+        await executeDownload(item);
+      }
     } catch (err) {
-      notifyDownload(item.url, { state: "error", error: err.message });
+      if (err && err.cancelled) notifyDownload(item.url, { state: "cancelled" });
+      else notifyDownload(item.url, { state: "error", error: err.message });
     } finally {
+      cancelled.delete(item.url);
       activeDownloads--;
       browser.runtime.sendMessage({
         action: "queue_update",
@@ -1558,7 +2089,8 @@ function reportDownloadResult(url, result) {
     segments: result.segments || 0,
     fallback: !!result.fallback,
     separateAudio: !!result.separateAudio,
-    audioFilename: result.audioFilename || null
+    audioFilename: result.audioFilename || null,
+    subtitles: result.subtitles || null
   });
 }
 
@@ -1573,8 +2105,8 @@ async function executeDownload(item) {
     return result;
   }
 
-  // HLS stream download
-  if (/\.m3u8(\?|$)/i.test(url)) {
+  // HLS or DASH stream download
+  if (/\.(m3u8|mpd)(\?|$)/i.test(url)) {
     const result = await downloadStream(tabId, url, filename, quality);
     reportDownloadResult(url, result);
     return result;
@@ -1635,19 +2167,42 @@ browser.webRequest.onHeadersReceived.addListener(
     if (isMedia) {
       const isM3U8 = /\.m3u8(\?|$)/i.test(url);
       const isMPD = /\.mpd(\?|$)/i.test(url);
-      const isManifest = isM3U8 || isMPD;
 
-      if (isManifest && fileSize && fileSize < 50000) {
-        if (isM3U8) {
-          parseM3U8(url, tabContext(details.tabId)).then((parsed) => {
-            if (!parsed) return;
-            linkManifestToStreams(details.tabId, url, parsed);
-          });
-        }
+      // A small m3u8 is usually a variant playlist rather than the master, so
+      // it only serves to link captured segments to their manifest. An MPD has
+      // no such distinction: it is always the whole description, and a few
+      // kilobytes is its normal size.
+      if (isM3U8 && fileSize && fileSize < 50000) {
+        parseM3U8(url, tabContext(details.tabId)).then((parsed) => {
+          if (!parsed) return;
+          linkManifestToStreams(details.tabId, url, parsed);
+        });
         return;
       }
 
       if (/auth|token|drm|license|widevine|playready/i.test(url)) return;
+
+      if (isMPD) {
+        parseMPD(url, tabContext(details.tabId)).then((parsed) => {
+          if (!parsed) return;
+
+          const qualities = parsed.video.map((t) => t.height).filter(Boolean).sort((a, b) => b - a);
+          addMediaToTab(details.tabId, {
+            url,
+            domain: getDomain(url),
+            filename: getFilenameFromUrl(url),
+            type: "stream",
+            quality: qualities[0] || null,
+            source: "dash",
+            isDashManifest: true,
+            availableQualities: qualities,
+            audioGroups: parsed.audio.length,
+            size: fileSize,
+            duration: parsed.totalDuration || null
+          });
+        });
+        return;
+      }
 
       if (isM3U8) {
         parseM3U8(url, tabContext(details.tabId)).then((parsed) => {
@@ -1716,14 +2271,13 @@ browser.tabs.onRemoved.addListener((tabId) => {
   delete tabWatchMode[tabId];
   delete tabPrivate[tabId];
   delete tabPageUrl[tabId];
+  delete adsHidden[tabId];
+  delete tabUsesMediaSource[tabId];
 });
 
 browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === "loading") {
-    delete tabMedia[tabId];
-    delete tabStreams[tabId];
-    delete tabHLS[tabId];
-    updateBadge(tabId);
+    clearTabMedia(tabId);
   }
   if (changeInfo.title || (tab && tab.title)) {
     tabTitles[tabId] = changeInfo.title || tab.title;
@@ -1746,6 +2300,9 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
         addMediaToTab(tabId, mediaInfo);
       });
       if (message.pageTitle) tabTitles[tabId] = message.pageTitle;
+    }
+    if (tabId && message.usesMediaSource) {
+      tabUsesMediaSource[tabId] = true;
     }
     return;
   }
@@ -1817,14 +2374,40 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
           pageTitle,
           streams,
           isPrivate: isPrivateTab(tabId),
+          adsHidden: adsHidden[tabId] || 0,
+          usesMediaSource: !!tabUsesMediaSource[tabId],
           watchMode: !!tabWatchMode[tabId],
           queueLength: downloadQueue.length,
           activeDownloads
         });
       } else {
-        sendResponse({ media: [], pageTitle: "", streams: [], isPrivate: false, watchMode: false, queueLength: 0, activeDownloads: 0 });
+        sendResponse({ media: [], pageTitle: "", streams: [], isPrivate: false, adsHidden: 0, usesMediaSource: false, watchMode: false, queueLength: 0, activeDownloads: 0 });
       }
     });
+    return true;
+  }
+
+  // Clear everything detected in this tab
+  if (message.action === "clear_media") {
+    browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => {
+      if (!tabs[0]) { sendResponse({ cleared: false }); return; }
+      clearTabMedia(tabs[0].id);
+      browser.tabs.sendMessage(tabs[0].id, { action: "forget" }).catch(() => {});
+      sendResponse({ cleared: true });
+    });
+    return true;
+  }
+
+  // Cancel a queued or running download
+  if (message.action === "cancel_download") {
+    cancelled.add(message.url);
+    const waiting = downloadQueue.findIndex((item) => item.url === message.url);
+    if (waiting >= 0) {
+      downloadQueue.splice(waiting, 1);
+      cancelled.delete(message.url);
+      notifyDownload(message.url, { state: "cancelled" });
+    }
+    sendResponse({ cancelled: true });
     return true;
   }
 

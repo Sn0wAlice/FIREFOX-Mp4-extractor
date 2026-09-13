@@ -6,7 +6,6 @@ const DEFAULTS = {
   minSize: 0,
   maxSize: 0,
   formats: ["mp4", "webm", "mkv", "avi", "mov", "ts", "m3u8", "mpd", "mp3", "m4a", "ogg", "wav", "flac"],
-  networkIntercept: true,
   deepScan: true,
   showThumbnails: true,
   showBadge: true,
@@ -15,6 +14,7 @@ const DEFAULTS = {
   hoverPreview: true,
   smartDedup: true,
   showSource: true,
+  hideAds: true,
   maxConcurrent: 2,
   defaultRenamePattern: "{title}_{quality}_{index}",
   blacklist: []
@@ -39,7 +39,6 @@ function loadOptions() {
     document.getElementById("filenamePattern").value = opts.filenamePattern || "original";
     document.getElementById("minSize").value = opts.minSize || 0;
     document.getElementById("maxSize").value = opts.maxSize || 0;
-    document.getElementById("networkIntercept").checked = opts.networkIntercept !== false;
     document.getElementById("deepScan").checked = opts.deepScan !== false;
     document.getElementById("showThumbnails").checked = opts.showThumbnails !== false;
     document.getElementById("showBadge").checked = opts.showBadge !== false;
@@ -48,6 +47,7 @@ function loadOptions() {
     document.getElementById("hoverPreview").checked = opts.hoverPreview !== false;
     document.getElementById("smartDedup").checked = opts.smartDedup !== false;
     document.getElementById("showSource").checked = opts.showSource !== false;
+    document.getElementById("hideAds").checked = opts.hideAds !== false;
     document.getElementById("maxConcurrent").value = opts.maxConcurrent || 2;
     document.getElementById("defaultRenamePattern").value = opts.defaultRenamePattern || "{title}_{quality}_{index}";
 
@@ -75,7 +75,6 @@ function saveOptions() {
     minSize: parseInt(document.getElementById("minSize").value) || 0,
     maxSize: parseInt(document.getElementById("maxSize").value) || 0,
     formats,
-    networkIntercept: document.getElementById("networkIntercept").checked,
     deepScan: document.getElementById("deepScan").checked,
     showThumbnails: document.getElementById("showThumbnails").checked,
     showBadge: document.getElementById("showBadge").checked,
@@ -84,6 +83,7 @@ function saveOptions() {
     hoverPreview: document.getElementById("hoverPreview").checked,
     smartDedup: document.getElementById("smartDedup").checked,
     showSource: document.getElementById("showSource").checked,
+    hideAds: document.getElementById("hideAds").checked,
     maxConcurrent: parseInt(document.getElementById("maxConcurrent").value) || 2,
     defaultRenamePattern: document.getElementById("defaultRenamePattern").value || "{title}_{quality}_{index}",
     blacklist: currentBlacklist

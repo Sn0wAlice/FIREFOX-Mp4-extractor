@@ -29,12 +29,27 @@
     return document.title || "";
   }
 
+  let usesMediaSource = false;
+  // Deep scan walks inline scripts, JSON-LD and same-origin iframes. It finds
+  // more, and costs more on heavy pages, so it can be turned off.
+  let deepScan = true;
+  browser.storage.local.get("options").then((r) => {
+    deepScan = !r.options || r.options.deepScan !== false;
+  }).catch(() => {});
+
   function scanPage() {
     const found = new Map();
 
     function add(url, source, extra) {
       try {
         const resolved = new URL(url, document.location.href).href;
+        // A blob: URL is a handle on a buffer the page filled through Media
+        // Source Extensions. Nothing can fetch it, so it only pollutes the
+        // list — the real stream shows up in the network layer instead.
+        if (!/^https?:\/\//i.test(resolved)) {
+          if (resolved.startsWith("blob:")) usesMediaSource = true;
+          return;
+        }
         if (!found.has(resolved)) {
           found.set(resolved, {
             url: resolved,
@@ -113,7 +128,7 @@
     });
 
     // 7. Inline scripts
-    document.querySelectorAll("script:not([src])").forEach((script) => {
+    if (deepScan) document.querySelectorAll("script:not([src])").forEach((script) => {
       const text = script.textContent;
       if (!text) return;
       MEDIA_REGEX.lastIndex = 0;
@@ -124,7 +139,7 @@
     });
 
     // 8. Same-origin iframes
-    document.querySelectorAll("iframe").forEach((iframe) => {
+    if (deepScan) document.querySelectorAll("iframe").forEach((iframe) => {
       try {
         const doc = iframe.contentDocument;
         if (!doc) return;
@@ -148,7 +163,7 @@
     });
 
     // 9. JSON-LD
-    document.querySelectorAll('script[type="application/ld+json"]').forEach((script) => {
+    if (deepScan) document.querySelectorAll('script[type="application/ld+json"]').forEach((script) => {
       try {
         const json = JSON.parse(script.textContent);
         extractUrlsFromJson(json).forEach((url) => add(url, "json-ld"));
@@ -185,26 +200,40 @@
   let lastFoundUrls = new Set();
 
   function runScan() {
+    usesMediaSource = false;
     const links = scanPage();
     const pageTitle = getPageTitle();
-    if (links.length === 0) return;
+
+    // Worth reporting even with nothing found: it tells the popup the page
+    // streams through MSE, so the user knows to let the video play.
+    if (links.length === 0 && !usesMediaSource) return;
 
     const currentUrls = new Set(links.map((l) => l.url));
     const hasNew = links.some((l) => !lastFoundUrls.has(l.url));
-    if (!hasNew && currentUrls.size === lastFoundUrls.size) return;
+    if (links.length > 0 && !hasNew && currentUrls.size === lastFoundUrls.size) return;
 
     lastFoundUrls = currentUrls;
-    browser.runtime.sendMessage({ action: "media_links", links, pageTitle });
+    browser.runtime.sendMessage({ action: "media_links", links, pageTitle, usesMediaSource });
   }
 
   runScan();
 
   browser.runtime.onMessage.addListener((message) => {
-    if (message.action === "rescan") {
+    if (message.action === "rescan" || message.action === "forget") {
       lastFoundUrls.clear();
-      runScan();
+      if (message.action === "rescan") runScan();
     }
   });
+
+  // A single page application swaps videos without ever reloading, so the
+  // scan has to follow its navigations too.
+  let lastHref = location.href;
+  setInterval(() => {
+    if (location.href === lastHref) return;
+    lastHref = location.href;
+    lastFoundUrls.clear();
+    runScan();
+  }, 1000);
 
   let mutationTimer = null;
   const observer = new MutationObserver(() => {

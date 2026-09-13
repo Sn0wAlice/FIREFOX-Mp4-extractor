@@ -40,6 +40,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     allMedia = deduplicateMedia(response.media);
     pageTitle = response.pageTitle || "";
     isPrivateContext = !!response.isPrivate;
+    updateNotice(response);
     watchMode = response.watchMode || false;
     updateWatchButton();
     updateQueueBar(response.queueLength || 0, response.activeDownloads || 0);
@@ -155,7 +156,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     document.getElementById("renameModal").classList.remove("active");
   });
   document.getElementById("renameConfirmBtn").addEventListener("click", executeBatchRename);
-  document.getElementById("renamePattern").addEventListener("input", updateRenamePreview);
+  document.getElementById("renamePattern").addEventListener("input", (e) => {
+    e.target.dataset.touched = "1";
+    updateRenamePreview();
+  });
 
   // Watch mode
   document.getElementById("watchBtn").addEventListener("click", async () => {
@@ -165,6 +169,20 @@ document.addEventListener("DOMContentLoaded", async () => {
       updateWatchButton();
       showToast(watchMode ? "Watch mode ON — new media will auto-download" : "Watch mode OFF");
     }
+  });
+
+  // Clear everything this tab has collected. A single page application never
+  // reloads, so without this the list keeps every video ever opened in it.
+  document.getElementById("clearBtn").addEventListener("click", async () => {
+    await browser.runtime.sendMessage({ action: "clear_media" });
+    allMedia = [];
+    filteredMedia = [];
+    selectedUrls.clear();
+    downloadStates = {};
+    metadataCache.clear();
+    document.getElementById("noticeBar").classList.remove("visible");
+    render();
+    showToast("Panel cleared — play the video again to detect it");
   });
 
   // Rescan
@@ -241,6 +259,22 @@ function updateWatchButton() {
 
 // ── Queue bar ──
 
+// Says out loud what was hidden and why, so nothing disappears silently.
+function updateNotice(response) {
+  const bar = document.getElementById("noticeBar");
+  const parts = [];
+
+  if (response.adsHidden > 0) {
+    parts.push(`<b>${response.adsHidden}</b> advertising item${response.adsHidden > 1 ? "s" : ""} hidden`);
+  }
+  if (response.usesMediaSource) {
+    parts.push("this player streams through MSE — let the video play so its segments are captured");
+  }
+
+  bar.innerHTML = parts.join(" &middot; ");
+  bar.classList.toggle("visible", parts.length > 0);
+}
+
 function updateQueueBar(queueLength, active) {
   const bar = document.getElementById("queueBar");
   if (queueLength === 0 && active === 0) {
@@ -257,7 +291,8 @@ function updateQueueBar(queueLength, active) {
 function deduplicateMedia(media) {
   const byFingerprint = new Map();
   media.forEach((m) => {
-    const fp = m.fingerprint || m.url;
+    // Without smart dedup, entries are only merged when their URL matches.
+    const fp = options.smartDedup === false ? m.url : (m.fingerprint || m.url);
     if (!byFingerprint.has(fp)) {
       byFingerprint.set(fp, { ...m });
     } else {
@@ -416,6 +451,10 @@ function updateMediaMeta(url) {
 // ── Quality grouping ──
 
 function groupByQuality(mediaList) {
+  if (options.groupQuality === false) {
+    return mediaList.map((m) => ({ type: "single", media: m }));
+  }
+
   const groups = new Map();
   const standalone = [];
 
@@ -504,7 +543,8 @@ function renderMediaItem(container, media) {
   const isSelected = selectedUrls.has(media.url);
   const dlState = downloadStates[media.url];
 
-  const baseClass = "media-item" + (media.duplicate ? " is-duplicate" : "");
+  const showDupes = options.detectDuplicates !== false;
+  const baseClass = "media-item" + (media.duplicate && showDupes ? " is-duplicate" : "");
   item.className = baseClass + progressRowClass(dlState);
   item.dataset.rowClass = baseClass;
   item.dataset.url = media.url;
@@ -513,7 +553,7 @@ function renderMediaItem(container, media) {
   const isHLSMaster = media.isHLSMaster;
 
   const qualityHtml = media.quality ? `<span class="quality-badge">${media.quality}p</span>` : "";
-  const dupeHtml = media.duplicate ? `<span class="duplicate-badge">DUPE</span>` : "";
+  const dupeHtml = media.duplicate && showDupes ? `<span class="duplicate-badge">DUPE</span>` : "";
   const sizeHtml = media.size ? `<span>${formatSize(media.size)}</span>` : "";
 
   // Resolution
@@ -528,7 +568,9 @@ function renderMediaItem(container, media) {
 
   // Source badge
   const src = getSourceLabel(media);
-  const sourceHtml = `<span class="source-badge ${src.cls}">${src.label}</span>`;
+  const sourceHtml = options.showSource === false
+    ? ""
+    : `<span class="source-badge ${src.cls}">${src.label}</span>`;
 
   // Stream badges
   const streamBadge = isStream
@@ -540,7 +582,7 @@ function renderMediaItem(container, media) {
       ? `<span class="tag stream">HLS</span>`
       : `<span class="tag ${media.type}">${getExtension(media.filename) || media.type.toUpperCase()}</span>`;
 
-  const thumbHtml = !isStream && media.type === "video"
+  const thumbHtml = !isStream && media.type === "video" && options.showThumbnails !== false
     ? `<video src="${escapeHtml(media.url)}" preload="metadata" muted></video>${durOverlay}`
     : `<span class="type-icon">${isStream ? "\uD83D\uDCE1" : getTypeIcon(media.type)}</span>`;
 
@@ -597,7 +639,7 @@ function renderMediaItem(container, media) {
 
   // Download
   const dlBtn = item.querySelector(".dl-btn");
-  dlBtn.addEventListener("click", () => downloadMedia(media));
+  dlBtn.addEventListener("click", () => toggleDownload(media));
 
   // Video thumbnail
   if (!isStream && media.type === "video") {
@@ -701,6 +743,7 @@ function renderQualityGroup(container, group) {
 }
 
 function getDlButtonContent(state) {
+  if (state.state === "cancelling") return '<span class="btn-text">\u2026</span>';
   if (state.state === "downloading") {
     if (isMuxing(state)) return '<span class="btn-text">MUX</span>';
     return `<span class="btn-text">${Math.round(state.progress > 0 ? state.progress : 0)}%</span>`;
@@ -720,6 +763,7 @@ function isMuxing(state) {
 
 function progressRowClass(state) {
   if (!state) return "";
+  if (state.state === "cancelling") return " is-queued";
   if (state.state === "queued") return " is-queued";
   if (state.state === "done") return " is-done";
   if (state.state === "downloading") return isMuxing(state) ? " is-downloading is-muxing" : " is-downloading";
@@ -734,6 +778,7 @@ function progressWidth(state) {
 
 function progressLabelText(state) {
   if (!state) return "";
+  if (state.state === "cancelling") return "Stopping\u2026";
   if (state.state === "queued") return "Queued";
   if (state.state === "done") return "Done";
   if (state.state !== "downloading") return "";
@@ -749,7 +794,7 @@ function showEmpty() {
     <div class="empty-state">
       <div class="empty-icon">\uD83D\uDCED</div>
       <div class="empty-title">No media found</div>
-      <div class="empty-desc">Try refreshing the page or click rescan.<br>Navigate to a page with videos or audio.</div>
+      <div class="empty-desc">Let the video play for a few seconds, then rescan.<br>Players that stream through MSE only reveal their segments once playing.</div>
     </div>
   `;
   document.getElementById("downloadAll").disabled = true;
@@ -790,6 +835,7 @@ function updateFooter() {
 // ── Hover preview ──
 
 function setupHoverPreview() {
+  if (options.hoverPreview === false) return;
   const preview = document.getElementById("hoverPreview");
   const previewVideo = preview.querySelector("video");
   let hoverTimeout = null;
@@ -891,6 +937,23 @@ function downloadAsFile(content, filename, mimeType) {
 
 // ── Download ──
 
+// The same button starts and stops: once a download is running it becomes the
+// only place to stop it.
+function toggleDownload(media) {
+  const state = downloadStates[media.url];
+  if (state && (state.state === "downloading" || state.state === "queued")) {
+    cancelDownload(media.url);
+    return;
+  }
+  downloadMedia(media);
+}
+
+function cancelDownload(url) {
+  downloadStates[url] = { state: "cancelling", progress: 0 };
+  renderDownloadState(url);
+  browser.runtime.sendMessage({ action: "cancel_download", url }).catch(() => {});
+}
+
 function downloadMedia(media) {
   if (downloadStates[media.url] && (downloadStates[media.url].state === "downloading" || downloadStates[media.url].state === "queued")) return;
 
@@ -932,6 +995,14 @@ function handleDownloadUpdate(message) {
     renderDownloadState(url);
     if (message.fallback) showToast("Remux failed — saved as .ts");
     if (message.separateAudio) showToast("Audio track saved separately: " + message.audioFilename);
+    if (message.subtitles) showToast(`${message.subtitles.length} subtitle track(s) saved`);
+    return;
+  }
+
+  if (message.state === "cancelled") {
+    delete downloadStates[url];
+    renderDownloadState(url);
+    showToast("Download stopped");
     return;
   }
 
@@ -1001,6 +1072,10 @@ function renderDownloadState(url) {
 // ── Batch rename ──
 
 function openBatchRename() {
+  const field = document.getElementById("renamePattern");
+  if (!field.dataset.touched && options.defaultRenamePattern) {
+    field.value = options.defaultRenamePattern;
+  }
   document.getElementById("renameModal").classList.add("active");
   updateRenamePreview();
 }

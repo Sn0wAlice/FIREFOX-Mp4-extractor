@@ -92,6 +92,19 @@
 
     .header-actions { display: flex; gap: 4px; }
 
+    .notice-bar {
+      display: none;
+      padding: 5px 16px;
+      font-size: 10px;
+      color: var(--text-dim);
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      gap: 6px;
+      align-items: center;
+    }
+    .notice-bar.visible { display: flex; }
+    .notice-bar b { color: var(--text); font-weight: 600; }
+
     .icon-btn {
       width: 28px;
       height: 28px;
@@ -489,8 +502,14 @@
     .copy-btn:hover { color: var(--text); border-color: var(--accent); }
     .copy-btn.copied { background: var(--green); color: white; border-color: var(--green); }
 
-    .dl-btn.downloading { background: var(--surface2); cursor: default; pointer-events: none; }
-    .dl-btn.queued { background: var(--surface2); cursor: default; opacity: 0.6; }
+    /* A running download stays clickable — that is how it is stopped. */
+    .dl-btn.downloading, .dl-btn.queued { background: var(--surface2); }
+    .dl-btn.queued { opacity: 0.6; }
+    .dl-btn.downloading:hover, .dl-btn.queued:hover { background: var(--orange); color: white; }
+    .dl-btn.downloading:hover .btn-text, .dl-btn.queued:hover .btn-text { font-size: 0; }
+    .dl-btn.downloading:hover .btn-text::after,
+    .dl-btn.queued:hover .btn-text::after { content: "\2715"; font-size: 11px; }
+    .dl-btn.cancelling { background: var(--surface2); cursor: default; pointer-events: none; opacity: 0.6; }
 
     .dl-btn .btn-text { position: relative; z-index: 1; font-size: 11px; }
     .dl-btn.done { background: var(--green); }
@@ -757,6 +776,7 @@
         <button class="icon-btn" id="watchBtn" title="Watch mode — auto-download new media">&#9673;</button>
         <button class="icon-btn" id="themeBtn" title="Toggle theme">&#9788;</button>
         <button class="icon-btn" id="rescanBtn" title="Rescan page">&#8635;</button>
+        <button class="icon-btn" id="clearBtn" title="Clear everything detected in this tab">&#128465;</button>
         <button class="icon-btn" id="optionsBtn" title="Options">&#9881;</button>
       </div>
     </div>
@@ -802,6 +822,8 @@
   </div>
 
   <!-- Queue indicator -->
+  <div class="notice-bar" id="noticeBar"></div>
+
   <div class="queue-bar" id="queueBar">
     <span>Queue:</span>
     <span class="queue-count" id="queueCount">0</span>
