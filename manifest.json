@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "Media Extractor Pro",
-  "version": "4.0",
-  "description": "The ultimate media extraction toolkit for Firefox. Detect, preview, and download videos, audio, and HLS/DASH streams from any webpage. Smart deduplication, download queue, hover preview, resolution & duration display, source tracking, batch rename, watch mode, size filter, quality grouping, best-quality download, TS-to-MP4 transmuxing, dark/light theme, blacklist, and export.",
+  "version": "5.0",
+  "description": "Detect, preview and download video and audio from any page. HLS and DASH streams are reassembled into a single progressive MP4 that plays in VLC and QuickTime, with AES-128 decryption, byte-range and fragmented-MP4 playlists, subtitle tracks, segment retry and cancellation. Smart deduplication, download queue, quality grouping, batch rename, watch mode, advertising filter, private-window isolation, dark/light theme and export.",
   "icons": {
     "16": "icons/icon-16.png",
     "32": "icons/icon-32.png",
@@ -30,17 +30,35 @@
     }
   },
   "background": {
-    "scripts": ["lib/mux-shim.js", "background.js"],
+    "scripts": [
+      "lib/mux-shim.js",
+      "background.js"
+    ],
     "persistent": true
   },
-  "content_scripts": [{
-    "matches": ["<all_urls>"],
-    "js": ["content.js"],
-    "run_at": "document_idle",
-    "all_frames": true
-  }],
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
   "options_ui": {
     "page": "options.html",
     "open_in_tab": false
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    }
   }
 }

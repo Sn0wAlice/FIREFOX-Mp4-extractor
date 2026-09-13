@@ -333,9 +333,11 @@ function formatDuration(seconds) {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+// The filename comes from the page, so the extension drawn from it is escaped
+// like any other value on its way into innerHTML.
 function getExtension(filename) {
   const ext = filename.split("?")[0].split(".").pop().toUpperCase();
-  return ext.length <= 5 ? ext : "";
+  return ext.length <= 5 ? escapeHtml(ext) : "";
 }
 
 function getTypeIcon(type) {
