@@ -11,6 +11,14 @@ progressive MP4 that plays in VLC and QuickTime.
 - HLS: master/variant playlists, AES-128 (clear key only), byte ranges,
   fragmented MP4, subtitles
 - DASH (MPD) manifests
+- A separate audio rendition (DASH, or HLS with fragmented MP4) is merged
+  with the video into a single MP4; other combinations (TS video, ADTS audio)
+  are saved as two files
+- MSE capture: for players that stream through Media Source Extensions
+  (`blob:` video), the bytes the player appends are captured and saved as one
+  MP4 (video + audio merged). Only what has been played is captured, so the
+  video has to be played to the end; WebM captures are saved as separate
+  video and audio files
 - Download queue with retry and cancellation, quality grouping, batch rename,
   duplicate detection, ad filter, watch mode
 - Private windows: downloads stay in the private session, requests are sent
@@ -30,6 +38,7 @@ DRM-protected streams (Widevine, PlayReady, licence servers) are not supported.
 | `manifest.json` | Manifest V2 |
 | `background.js` | Network detection, manifest parsing, download queue, remuxing |
 | `content.js` | DOM scan of each page and frame |
+| `mse-capture.js` | Hooks `SourceBuffer.appendBuffer` at `document_start` to capture MSE playback |
 | `popup.html/js` | Media list and download UI |
 | `options.html/js` | Settings |
 | `lib/mux-shim.js` | Unmodified [mux.js](https://github.com/videojs/mux.js) 7.0.3 plus a CommonJS shim |

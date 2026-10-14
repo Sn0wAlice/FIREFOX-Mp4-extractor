@@ -662,6 +662,7 @@ async function parseM3U8(url, ctx) {
           const info = lines[i];
           const bwMatch = info.match(/BANDWIDTH=(\d+)/);
           const resMatch = info.match(/RESOLUTION=(\d+)x(\d+)/);
+          const codecs = (info.match(/CODECS="([^"]*)"/) || [])[1] || "";
           const nextLine = lines[i + 1];
           if (nextLine && !nextLine.startsWith("#")) {
             const variantUrl = resolveUrl(nextLine, url);
@@ -671,10 +672,17 @@ async function parseM3U8(url, ctx) {
               bandwidth: bwMatch ? parseInt(bwMatch[1]) : 0,
               width: resMatch ? parseInt(resMatch[1]) : 0,
               height: resMatch ? parseInt(resMatch[2]) : 0,
-              quality: resMatch ? parseInt(resMatch[2]) : null
+              quality: resMatch ? parseInt(resMatch[2]) : null,
+              audioOnly: !resMatch && codecs !== "" && !/(avc[13]|hvc1|hev1|vp0?[89]|av01|dv[ha][1e]|mp4v)/i.test(codecs)
             });
           }
         }
+      }
+      // Some packagers list the audio rendition as a variant too. Being the
+      // highest bandwidth, it would be picked as "best" and the download
+      // would come out with no picture.
+      if (result.variants.some((v) => !v.audioOnly)) {
+        result.variants = result.variants.filter((v) => !v.audioOnly);
       }
     } else {
       // Media playlist — also sum duration
@@ -921,7 +929,7 @@ function dashSegments(parsed, qualityHeight) {
 
   return {
     video: video ? video.segments : [],
-    // DASH always keeps audio in its own track, so it is written as its own file.
+    // DASH always keeps audio in its own track; downloadStream joins it back.
     audio: video && audio ? audio.segments : (audio ? audio.segments : []),
     subtitles: [],
     duration: parsed.totalDuration || 0,
@@ -1021,27 +1029,64 @@ async function downloadStream(tabId, url, filename, qualityHeight, progressKey =
 
   reportProgress(progressKey, 1, `Found ${segmentUrls.length} segments (${source})`);
 
+  // Next to fragmented-MP4 video the audio is fetched first so both can be
+  // joined into one file. mergeFragmentedTracks refuses what it cannot join
+  // (ADTS audio, no init segment), which falls back to two files.
+  const joinAudio = fragmentedMp4 && audioSegmentUrls.length > 0;
+  const total = segmentUrls.length + (joinAudio ? audioSegmentUrls.length : 0);
+
   const video = await downloadSegmentsWithProgress(
-    segmentUrls, progressKey, 0, segmentUrls.length, ctx
+    segmentUrls, progressKey, 0, total, ctx
   );
 
   const incomplete = segmentFailureError(video, segmentUrls.length, ctx);
   if (incomplete) return incomplete;
 
-  const result = await writeSegmentsAsVideo(
-    video.chunks, filename, progressKey, tabId, playlistDuration, fragmentedMp4
-  );
-  result.segments = segmentUrls.length;
+  let audioChunks = null;
+  if (joinAudio) {
+    const audio = await downloadSegmentsWithProgress(
+      audioSegmentUrls, progressKey, segmentUrls.length, total, ctx
+    );
+    if (audio.chunks.length > 0) audioChunks = audio.chunks;
+  }
 
-  // A separate audio rendition cannot be muxed into the video stream here, so
-  // it is written as its own file instead of being appended to the video.
-  if (audioSegmentUrls.length > 0) {
-    const audio = await downloadAudioRendition(audioSegmentUrls, filename, progressKey, tabId, ctx);
-    if (audio) {
+  let result = null;
+  if (audioChunks) {
+    reportProgress(progressKey, -1, "Merging audio and video...");
+    const videoBytes = mergeChunks(video.chunks);
+    video.chunks.length = 0;
+    const audioBytes = mergeChunks(audioChunks);
+    audioChunks = null;
+
+    let joined = mergeFragmentedTracks(videoBytes, audioBytes);
+    const progressive = joined && fragmentedToProgressiveMp4(joined);
+    joined = null;
+    if (progressive) {
+      let mp4Filename = filename.replace(/\.(m3u8|mpd|ts|aac|m4s|ism).*$/i, ".mp4");
+      if (!mp4Filename.endsWith(".mp4")) mp4Filename += ".mp4";
+      const blobUrl = URL.createObjectURL(new Blob([progressive], { type: "video/mp4" }));
+      const downloadId = await startDownload({ url: blobUrl, filename: mp4Filename }, tabId);
+      result = { downloadId, filename: mp4Filename };
+    } else {
+      // Join refused: same two files as before, from the bytes already here.
+      result = await writeSegmentsAsVideo([videoBytes], filename, progressKey, tabId, playlistDuration, fragmentedMp4);
+      const audio = await writeAudioRendition([audioBytes], audioSegmentUrls, filename, tabId);
       result.separateAudio = true;
       result.audioFilename = audio.filename;
     }
+  } else {
+    result = await writeSegmentsAsVideo(
+      video.chunks, filename, progressKey, tabId, playlistDuration, fragmentedMp4
+    );
+    if (audioSegmentUrls.length > 0) {
+      const audio = await downloadAudioRendition(audioSegmentUrls, filename, progressKey, tabId, ctx);
+      if (audio) {
+        result.separateAudio = true;
+        result.audioFilename = audio.filename;
+      }
+    }
   }
+  result.segments = segmentUrls.length;
 
   if (subtitleTracks.length > 0) {
     reportProgress(progressKey, -1, "Downloading subtitles...");
@@ -1679,6 +1724,78 @@ function fragmentedToProgressiveMp4(bytes) {
   return out;
 }
 
+// Joins a video-only and an audio-only fragmented MP4 (what an MSE player or a
+// DASH manifest delivers as two SourceBuffers) into one fragmented MP4 holding
+// both tracks, ready for fragmentedToProgressiveMp4. The audio tracks are
+// renumbered after the video ones, patched in place in `audio`. Returns null
+// when a fragment uses absolute data offsets, which moving it would break.
+function mergeFragmentedTracks(video, audio) {
+  const vView = new DataView(video.buffer, video.byteOffset, video.byteLength);
+  const aView = new DataView(audio.buffer, audio.byteOffset, audio.byteLength);
+  const vTop = readBoxes(vView, 0, video.byteLength);
+  const aTop = readBoxes(aView, 0, audio.byteLength);
+  const ftyp = vTop.find((b) => b.type === "ftyp");
+  const vMoov = vTop.find((b) => b.type === "moov");
+  const aMoov = aTop.find((b) => b.type === "moov");
+  if (!ftyp || !vMoov || !aMoov) return null;
+
+  const traks = (view, moov) => readBoxes(view, moov.body, moov.end).filter((b) => b.type === "trak");
+  const trackId = (view, trak) => trackHeaderFields(view, findBox(view, trak, "tkhd")).trackIdAt;
+
+  const renumber = new Map();
+
+  // Every traf of both files: a base-data-offset is a file position.
+  const fragments = (view, top, patch) => {
+    const out = [];
+    for (const b of top) {
+      if (b.type !== "moof" && b.type !== "mdat") continue;
+      if (b.type === "moof") {
+        for (const traf of readBoxes(view, b.body, b.end)) {
+          const tfhd = traf.type === "traf" && findBox(view, traf, "tfhd");
+          if (!tfhd) continue;
+          if (view.getUint32(tfhd.body) & 0x000001) return null;
+          if (patch) {
+            const id = renumber.get(view.getUint32(tfhd.body + 4));
+            if (id) view.setUint32(tfhd.body + 4, id);
+          }
+        }
+      }
+      out.push(new Uint8Array(view.buffer, view.byteOffset + b.body - 8, b.end - b.body + 8));
+    }
+    return out;
+  };
+  // Checked before anything is patched, so a refusal leaves `audio` intact
+  // for the two-file fallback.
+  const vFrags = fragments(vView, vTop, false);
+  if (!vFrags || !fragments(aView, aTop, false)) return null;
+
+  // tkhd, trex and every tfhd carry the track number; all must agree.
+  let nextId = Math.max(...traks(vView, vMoov).map((t) => vView.getUint32(trackId(vView, t)))) + 1;
+  for (const trak of traks(aView, aMoov)) {
+    const at = trackId(aView, trak);
+    renumber.set(aView.getUint32(at), nextId);
+    aView.setUint32(at, nextId++);
+  }
+  const mvex = findBox(aView, aMoov, "mvex");
+  for (const trex of mvex ? readBoxes(aView, mvex.body, mvex.end) : []) {
+    const id = trex.type === "trex" && renumber.get(aView.getUint32(trex.body + 4));
+    if (id) aView.setUint32(trex.body + 4, id);
+  }
+  const aFrags = fragments(aView, aTop, true);
+
+  const slice = (view, b) => new Uint8Array(view.buffer, view.byteOffset + b.body - 8, b.end - b.body + 8);
+  const moov = box("moov",
+    ...readBoxes(vView, vMoov.body, vMoov.end).filter((b) => b.type !== "mvex").map((b) => slice(vView, b)),
+    ...traks(aView, aMoov).map((b) => slice(aView, b))
+  );
+
+  const parts = [slice(vView, ftyp), moov, ...vFrags, ...aFrags];
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const part of parts) { out.set(part, at); at += part.length; }
+  return out;
+}
+
 // Merge downloaded segments, remux to MP4, and hand the result to the browser.
 // Falls back to writing the raw transport stream when remuxing fails.
 async function writeSegmentsAsVideo(chunks, filename, progressKey, tabId, knownDuration, fragmentedMp4) {
@@ -1734,7 +1851,10 @@ async function downloadAudioRendition(audioSegmentUrls, filename, progressKey, t
     audioSegmentUrls, progressKey, 0, audioSegmentUrls.length, ctx
   );
   if (chunks.length === 0) return null;
+  return writeAudioRendition(chunks, audioSegmentUrls, filename, tabId);
+}
 
+async function writeAudioRendition(chunks, audioSegmentUrls, filename, tabId) {
   const ext = /\.aac(\?|$)/i.test(audioSegmentUrls[0].url) ? ".aac" : ".m4a";
   const base = filename.replace(/\.(m3u8|mpd|ts|aac|m4a|mp4|ism).*$/i, "") || "audio";
   const audioFilename = base + ".audio" + ext;
@@ -2112,6 +2232,90 @@ function clearTabMedia(tabId) {
   updateBadge(tabId);
 }
 
+// ── MSE captures ──
+// mse-capture.js keeps the bytes in the page's frame; the background only
+// holds a summary until the user asks for the file.
+
+function addMseCapture(tabId, frameId, message) {
+  if (!tabMedia[tabId]) tabMedia[tabId] = new Map();
+  const url = `mse://${frameId}/${message.id}`;
+  const title = (message.pageTitle || "capture").replace(/[\\/:*?"<>|]+/g, "_").slice(0, 80);
+  tabMedia[tabId].set(url, {
+    url,
+    domain: "MSE capture",
+    filename: title + ".mp4",
+    type: "video",
+    size: message.size,
+    duration: message.duration || null,
+    capturedUntil: message.bufferedEnd || 0,
+    source: "mse",
+    isMseCapture: true,
+    drm: !!message.drm,
+    mseTracks: message.tracks.map((t) => t.mime),
+    fingerprint: url
+  });
+  updateBadge(tabId);
+}
+
+async function downloadMseCapture(tabId, url, filename) {
+  const [, frameId, id] = url.match(/^mse:\/\/(\d+)\/(\d+)$/) || [];
+  if (!frameId) return { error: "Invalid capture" };
+
+  const dump = await browser.tabs.sendMessage(
+    tabId, { action: "mse_dump", id: Number(id) }, { frameId: Number(frameId) }
+  ).catch(() => null);
+  if (!dump) return { error: "Capture lost — the page was closed or reloaded" };
+  if (dump.error) return { error: dump.error };
+  if (!dump.tracks.length) return { error: "Nothing captured yet — play the video first" };
+
+  const base = filename.replace(/\.(mp4|webm|m4a)$/i, "");
+  // The video track becomes the main file, any separate audio sits next to it.
+  let tracks = dump.tracks.sort((a, b) => (/^video/i.test(b.mime) ? 1 : 0) - (/^video/i.test(a.mime) ? 1 : 0));
+  const saved = [];
+
+  // The usual MP4 pair (one video, one audio SourceBuffer) becomes one file.
+  // ponytail: WebM pairs stay two files, joining them needs a Matroska muxer.
+  if (tracks.length === 2 && tracks.every((t) => /mp4/i.test(t.mime)) && /^audio/i.test(tracks[1].mime)) {
+    const video = mergeChunks(tracks[0].chunks);
+    const audio = mergeChunks(tracks[1].chunks);
+    const joined = mergeFragmentedTracks(video, audio);
+    const progressive = joined && fragmentedToProgressiveMp4(joined);
+    if (progressive) {
+      const name = base + ".mp4";
+      const blobUrl = URL.createObjectURL(new Blob([progressive], { type: "video/mp4" }));
+      await startDownload({ url: blobUrl, filename: name }, tabId);
+      return { segments: 2 };
+    }
+    tracks = [{ mime: tracks[0].mime, chunks: [video] }, { mime: tracks[1].mime, chunks: [audio] }];
+  }
+
+  for (const [i, track] of tracks.entries()) {
+    const isWebm = /webm/i.test(track.mime);
+    const isAudio = /^audio/i.test(track.mime);
+    let bytes = mergeChunks(track.chunks);
+    track.chunks = null;
+
+    if (!isWebm) {
+      const progressive = fragmentedToProgressiveMp4(bytes);
+      if (progressive) bytes = progressive;
+      else repairFragmentedMp4Duration(bytes);
+    }
+    // ponytail: WebM is written as init + clusters, it plays but has no seek
+    // index (Cues); rebuilding one means parsing every cluster.
+    const ext = isWebm ? ".webm" : (isAudio ? ".m4a" : ".mp4");
+    const name = (i > 0 || (isAudio && tracks.length > 1) ? base + ".audio" : base) + ext;
+    const blobUrl = URL.createObjectURL(new Blob([bytes], { type: track.mime.split(";")[0] }));
+    await startDownload({ url: blobUrl, filename: name }, tabId);
+    saved.push(name);
+  }
+
+  return {
+    segments: dump.tracks.length,
+    separateAudio: saved.length > 1,
+    audioFilename: saved[1] || null
+  };
+}
+
 // ── Download queue management ──
 
 async function queueUserDownload({ url, filename, tabId, pageTitle, quality }) {
@@ -2199,6 +2403,13 @@ function reportDownloadResult(url, result) {
 
 async function executeDownload(item) {
   const { url, filename, tabId, quality } = item;
+
+  // Bytes captured from a Media Source Extensions player
+  if (url.startsWith("mse://")) {
+    const result = await downloadMseCapture(tabId, url, filename);
+    reportDownloadResult(url, result);
+    return result;
+  }
 
   // Consolidated stream download
   if (url.startsWith("stream://")) {
@@ -2410,6 +2621,15 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     if (tabId && message.usesMediaSource) {
       tabUsesMediaSource[tabId] = true;
+    }
+    return;
+  }
+
+  // A Media Source player appended segments
+  if (message.action === "mse_update") {
+    if (sender.tab && message.tracks && message.tracks.length) {
+      markTabPrivacy(sender.tab.id, sender.tab.incognito);
+      addMseCapture(sender.tab.id, sender.frameId || 0, message);
     }
     return;
   }

@@ -59,13 +59,16 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Listen for messages
   browser.runtime.onMessage.addListener((message) => {
-    if (message.action === "media_links" || message.action === "new_media") {
+    if (message.action === "media_links" || message.action === "new_media" || message.action === "mse_update") {
       browser.runtime.sendMessage({ action: "get_media" }).then((resp) => {
         if (resp && resp.media) {
           const newMedia = deduplicateMedia(resp.media);
           const oldUrls = new Set(allMedia.map((m) => m.url));
-          const changed = newMedia.length !== allMedia.length || newMedia.some((m) => !oldUrls.has(m.url));
+          // An MSE capture keeps its URL while it grows, so its progress
+          // counts as a change too.
+          const changed = message.action === "mse_update" || newMedia.length !== allMedia.length || newMedia.some((m) => !oldUrls.has(m.url));
           if (!changed) return;
+          updateNotice(resp);
           allMedia = newMedia;
           if (resp.pageTitle) pageTitle = resp.pageTitle;
           render();
@@ -274,11 +277,14 @@ function updateNotice(response) {
   if (response.adsHidden > 0) {
     parts.push(`<b>${response.adsHidden}</b> advertising item${response.adsHidden > 1 ? "s" : ""} hidden`);
   }
-  if (response.usesMediaSource) {
-    parts.push("this player streams through MSE — let the video play so its segments are captured");
+  if (response.usesMediaSource || (response.media || []).some((m) => m.isMseCapture)) {
+    parts.push("<b>MSE capture:</b> only the part of the video already played is saved. " +
+      "To get the whole video, play it to the end without skipping (speed it up in the player if it allows). " +
+      "Long videos take as long to capture and use a lot of memory (several GB for a film in HD).");
   }
 
-  bar.innerHTML = parts.join(" &middot; ");
+  // One span: the bar is a flex row and would split <b> from its sentence.
+  bar.innerHTML = `<span>${parts.join(" &middot; ")}</span>`;
   bar.classList.toggle("visible", parts.length > 0);
 }
 
@@ -376,6 +382,7 @@ function getSourceLabel(media) {
   if (src === "network") return { label: "NET", cls: "network" };
   if (src === "hls-master" || src === "hls-media") return { label: "HLS", cls: "hls" };
   if (src === "auto-detected") return { label: "AUTO", cls: "auto" };
+  if (src === "mse") return { label: "MSE", cls: "mse" };
   return { label: "DOM", cls: "dom" };
 }
 
@@ -384,7 +391,7 @@ function getSourceLabel(media) {
 function probeMetadata(mediaList) {
   mediaList.forEach((m) => {
     if (metadataCache.has(m.url)) return;
-    if (m.type !== "video" || m.url.startsWith("stream://")) return;
+    if (m.type !== "video" || m.url.startsWith("stream://") || m.isMseCapture) return;
     if (m.resolution && m.duration) {
       metadataCache.set(m.url, { resolution: m.resolution, duration: m.duration });
       return;
@@ -553,7 +560,7 @@ function renderMediaItem(container, media) {
   const dlState = downloadStates[media.url];
 
   const showDupes = options.detectDuplicates !== false;
-  const baseClass = "media-item" + (media.duplicate && showDupes ? " is-duplicate" : "");
+  const baseClass = "media-item" + (media.duplicate && showDupes ? " is-duplicate" : "") + (media.isMseCapture ? " is-mse" : "");
   item.className = baseClass + progressRowClass(dlState);
   item.dataset.rowClass = baseClass;
   item.dataset.url = media.url;
@@ -591,9 +598,11 @@ function renderMediaItem(container, media) {
       ? `<span class="tag stream">HLS</span>`
       : `<span class="tag ${media.type}">${getExtension(media.filename) || media.type.toUpperCase()}</span>`;
 
-  const thumbHtml = !isStream && media.type === "video" && options.showThumbnails !== false
+  const thumbHtml = !isStream && !media.isMseCapture && media.type === "video" && options.showThumbnails !== false
     ? `<video src="${escapeHtml(media.url)}" preload="metadata" muted></video>${durOverlay}`
     : `<span class="type-icon">${isStream ? "\uD83D\uDCE1" : getTypeIcon(media.type)}</span>`;
+
+  const mseHtml = media.isMseCapture ? `<span class="mse-coverage">${mseCoverageText(media)}</span>` : "";
 
   const copyUrl = isStream ? (media.manifestUrl || media.firstSegmentUrl || media.url) : media.url;
 
@@ -614,6 +623,7 @@ function renderMediaItem(container, media) {
         <span>${escapeHtml(media.domain)}</span>
         ${sizeHtml}
         ${durHtml}
+        ${mseHtml}
       </div>
     </div>
     <div class="media-actions">
@@ -855,7 +865,7 @@ function setupHoverPreview() {
     const item = thumb.closest(".media-item");
     if (!item) return;
     const url = item.dataset.url;
-    if (!url || url.startsWith("stream://")) return;
+    if (!url || url.startsWith("stream://") || url.startsWith("mse://")) return;
 
     const media = allMedia.find((m) => m.url === url);
     if (!media || media.type !== "video") return;
@@ -963,7 +973,21 @@ function cancelDownload(url) {
   browser.runtime.sendMessage({ action: "cancel_download", url }).catch(() => {});
 }
 
+// "12:34 / 45:00 captured" — how much of the video the player has fed so far.
+function mseCoverageText(media) {
+  if (media.drm) return "DRM protected — cannot be saved";
+  if (!media.duration) return "captured so far";
+  const pct = Math.min(100, Math.round((media.capturedUntil / media.duration) * 100));
+  return `${formatDuration(media.capturedUntil)} / ${formatDuration(media.duration)} captured (${pct}%)`;
+}
+
 function downloadMedia(media) {
+  if (media.isMseCapture) {
+    if (media.drm) { showToast("DRM protected — this video cannot be saved"); return; }
+    if (media.duration && media.capturedUntil < media.duration - 2) {
+      showToast(`Partial: only ${mseCoverageText(media)} — play to the end for the full video`);
+    }
+  }
   if (downloadStates[media.url] && (downloadStates[media.url].state === "downloading" || downloadStates[media.url].state === "queued")) return;
 
   downloadStates[media.url] = { state: "queued", progress: 0 };
