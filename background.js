@@ -5,6 +5,8 @@
 
 const MEDIA_EXTENSIONS = /\.(mp4|webm|mkv|m3u8|mpd|mp3|m4a|ogg|wav|flac|avi|mov)(\?|$)/i;
 const MEDIA_CONTENT_TYPES = /^(video|audio)\//i;
+// Pictures smaller than this are thumbnails, icons and sprites.
+const NETWORK_IMAGE_MIN_BYTES = 150 * 1024;
 const QUALITY_REGEX = /(\d{3,4})p|(\d{3,4})x(\d{3,4})|[_\-.](\d{3,4})[_\-.]/i;
 
 // Patterns that indicate a segment (not a standalone file)
@@ -45,6 +47,7 @@ class DownloadCancelled extends Error {
 }
 // How many advertising items were hidden, per tab
 const adsHidden = {};
+const hiddenAds = {}; // tabId -> Set of hidden ad URLs
 // Tabs whose player streams through Media Source Extensions
 const tabUsesMediaSource = {};
 // Bumped whenever a tab's media is cleared, so late async results from the
@@ -52,6 +55,86 @@ const tabUsesMediaSource = {};
 const tabGen = {};
 let activeDownloads = 0;
 let maxConcurrentDownloads = 2;
+
+// ── Surviving the event page (Manifest V3) ──
+// Firefox unloads this page after 30 s without events, which wipes every
+// table above. Two answers:
+// - while downloads run, an extension API call every 20 s keeps it alive
+//   (a fetch in progress does not count as activity);
+// - what was detected per tab is saved to storage.session (memory only,
+//   never disk, so private-window data stays private) and merged back when
+//   the page starts again.
+
+let keepAliveTimer = null;
+
+function updateKeepAlive() {
+  const busy = activeDownloads > 0 || downloadQueue.length > 0 || blobUrls.size > 0;
+  if (busy && !keepAliveTimer) keepAliveTimer = setInterval(() => browser.runtime.getPlatformInfo(), 20000);
+  if (!busy && keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; }
+}
+
+const entriesOf = (map) => [...map.entries()];
+const perTab = (obj, f) => Object.fromEntries(Object.entries(obj).map(([tab, v]) => [tab, f(v)]));
+
+function snapshot(withStreams) {
+  return {
+    tabMedia: perTab(tabMedia, entriesOf),
+    tabStreams: withStreams ? perTab(tabStreams, (m) => entriesOf(m).map(([k, st]) => [k, { ...st, contentTypes: [...st.contentTypes], seen: null }])) : {},
+    tabHLS: withStreams ? perTab(tabHLS, entriesOf) : {},
+    hiddenAds: perTab(hiddenAds, (set) => [...set]),
+    plain: { tabTitles, tabPageUrl, tabPrivate, adsHidden, tabUsesMediaSource, tabWatchMode, tabGen },
+    downloadedFiles: entriesOf(downloadedFiles)
+  };
+}
+
+// Saved values only fill what is missing: events that arrived while the
+// saved state was being read are newer.
+function restoreState(state) {
+  if (!state) return;
+  const mergeMaps = (target, saved, revive = (v) => v) => {
+    for (const [tab, entries] of Object.entries(saved || {})) {
+      const map = target[tab] || (target[tab] = new Map());
+      for (const [k, v] of entries) if (!map.has(k)) map.set(k, revive(v));
+    }
+  };
+  mergeMaps(tabMedia, state.tabMedia);
+  mergeMaps(tabHLS, state.tabHLS);
+  mergeMaps(tabStreams, state.tabStreams, (st) => ({
+    ...st, contentTypes: new Set(st.contentTypes), seen: new Set(st.segments.map((seg) => seg.url))
+  }));
+  for (const [tab, urls] of Object.entries(state.hiddenAds || {})) {
+    const set = hiddenAds[tab] || (hiddenAds[tab] = new Set());
+    urls.forEach((u) => set.add(u));
+  }
+  const targets = { tabTitles, tabPageUrl, tabPrivate, adsHidden, tabUsesMediaSource, tabWatchMode, tabGen };
+  for (const [name, saved] of Object.entries(state.plain || {})) {
+    for (const [k, v] of Object.entries(saved || {})) if (!(k in targets[name])) targets[name][k] = v;
+  }
+  for (const [k, v] of state.downloadedFiles || []) if (!downloadedFiles.has(k)) downloadedFiles.set(k, v);
+}
+
+const stateReady = browser.storage.session.get("state")
+  .then((r) => restoreState(r.state))
+  .catch(() => {});
+
+// Throttled: at most one save every 3 s, always well before the 30 s idle
+// unload since every event that changes something schedules one.
+let saveTimer = null;
+
+function persistSoon() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(async () => {
+    saveTimer = null;
+    await stateReady;
+    try {
+      await browser.storage.session.set({ state: snapshot(true) });
+    } catch {
+      // ponytail: over the session quota (huge live streams), the segment
+      // lists are dropped from the save; detected media still survive.
+      await browser.storage.session.set({ state: snapshot(false) }).catch(() => {});
+    }
+  }, 3000);
+}
 
 // ── Options ──
 // The badge and the format filter are decided on the hot path of every
@@ -203,6 +286,7 @@ browser.downloads.onChanged.addListener((delta) => {
   if (blobUrls.has(delta.id)) {
     URL.revokeObjectURL(blobUrls.get(delta.id));
     blobUrls.delete(delta.id);
+    updateKeepAlive();
   }
   for (const [url, id] of browserDownloads) {
     if (id === delta.id) browserDownloads.delete(url);
@@ -223,7 +307,7 @@ function startDownload(options, tabId, sink = null) {
   return browser.downloads.download(
     isPrivateTab(tabId) ? { ...options, incognito: true } : options
   ).then(
-    (id) => { if (isBlob) blobUrls.set(id, options.url); return id; },
+    (id) => { if (isBlob) { blobUrls.set(id, options.url); updateKeepAlive(); } return id; },
     (err) => { if (isBlob) URL.revokeObjectURL(options.url); throw err; }
   );
 }
@@ -498,6 +582,7 @@ function addSegmentToStream(tabId, segmentInfo) {
 }
 
 function updateStreamEntry(tabId, key, stream) {
+  persistSoon();
   if (!tabMedia[tabId]) tabMedia[tabId] = new Map();
 
   const streamType = detectStreamType(stream.segments);
@@ -545,12 +630,18 @@ function addMediaToTab(tabId, mediaInfo, gen = tabGen[tabId]) {
 
   browser.storage.local.get("options").then((result) => {
     if (gen !== tabGen[tabId] || !tabMedia[tabId]) return;
+    persistSoon();
     const opts = result.options || {};
     const blacklist = opts.blacklist || [];
     if (isBlacklisted(mediaInfo.url, blacklist)) return;
 
-    if (opts.hideAds !== false && isAdvertising(mediaInfo.url)) {
-      adsHidden[tabId] = (adsHidden[tabId] || 0) + 1;
+    if (opts.hideAds !== false && (isAdvertising(mediaInfo.url) || mediaInfo.adLike)) {
+      // Every rescan reports the same items again; count each once.
+      const seen = hiddenAds[tabId] || (hiddenAds[tabId] = new Set());
+      if (!seen.has(mediaInfo.url)) {
+        seen.add(mediaInfo.url);
+        adsHidden[tabId] = (adsHidden[tabId] || 0) + 1;
+      }
       return;
     }
 
@@ -632,8 +723,8 @@ function updateBadge(tabId) {
   for (const m of tabMedia[tabId] ? tabMedia[tabId].values() : []) if (m.type !== "image") count++;
   const text = currentOptions.showBadge === false ? "" : (count > 0 ? String(count) : "");
   // Rejects for a tab that has just closed.
-  browser.browserAction.setBadgeText({ text, tabId }).catch(() => {});
-  browser.browserAction.setBadgeBackgroundColor({ color: count > 0 ? "#7c3aed" : "#666", tabId }).catch(() => {});
+  browser.action.setBadgeText({ text, tabId }).catch(() => {});
+  browser.action.setBadgeBackgroundColor({ color: count > 0 ? "#7c3aed" : "#666", tabId }).catch(() => {});
 }
 
 // ── HLS/DASH parsing ──
@@ -1817,6 +1908,200 @@ function mergeFragmentedTracks(video, audio) {
   return out;
 }
 
+// ── WebM index ──
+// An MSE capture of a WebM stream is its init segment (EBML header, Segment
+// of unknown size, Info, Tracks) followed by the Clusters the player
+// appended. That plays, but without Cues a player cannot seek and shows no
+// duration. This rewrites it as: EBML header, sized Segment, SeekHead, Info
+// (with Duration), Tracks, Clusters, Cues — one cue per cluster.
+
+const EBML = {
+  Segment: 0x18538067, SeekHead: 0x114d9b74, Seek: 0x4dbb, SeekID: 0x53ab, SeekPosition: 0x53ac,
+  Info: 0x1549a966, TimecodeScale: 0x2ad7b1, Duration: 0x4489, Tracks: 0x1654ae6b,
+  TrackEntry: 0xae, TrackNumber: 0xd7, TrackType: 0x83, Cluster: 0x1f43b675, Timecode: 0xe7,
+  SimpleBlock: 0xa3, BlockGroup: 0xa0, Block: 0xa1, Cues: 0x1c53bb6b, CuePoint: 0xbb, CueTime: 0xb3,
+  CueTrackPositions: 0xb7, CueTrack: 0xf7, CueClusterPosition: 0xf1, Void: 0xec
+};
+const EBML_LEVEL1 = new Set([EBML.Cluster, EBML.Cues, EBML.Info, EBML.Tracks, EBML.SeekHead, 0x1254c367, 0x1941a469, 0x1043a770]);
+
+function ebmlVint(bytes, pos, keepMarker) {
+  const first = bytes[pos];
+  let length = 1;
+  while (length <= 8 && !(first & (0x80 >> (length - 1)))) length++;
+  if (length > 8 || pos + length > bytes.length) return null;
+  let value = keepMarker ? first : first & (0xff >> length);
+  let allOnes = (first & (0xff >> length)) === (0xff >> length);
+  for (let i = 1; i < length; i++) {
+    value = value * 256 + bytes[pos + i];
+    if (bytes[pos + i] !== 0xff) allOnes = false;
+  }
+  return { value, length, unknown: !keepMarker && allOnes };
+}
+
+function ebmlElement(bytes, pos) {
+  const id = ebmlVint(bytes, pos, true);
+  const size = id && ebmlVint(bytes, pos + id.length, false);
+  if (!size) return null;
+  const data = pos + id.length + size.length;
+  return { id: id.value, data, end: size.unknown ? null : data + size.value };
+}
+
+function ebmlUint(bytes, start, end) {
+  let v = 0;
+  for (let i = start; i < end; i++) v = v * 256 + bytes[i];
+  return v;
+}
+
+function ebmlId(id) {
+  const out = [];
+  for (let v = id; v > 0; v = Math.floor(v / 256)) out.unshift(v & 0xff);
+  return out;
+}
+
+// Sizes are always written on 8 bytes so every length is known up front.
+function ebmlBox(id, ...payload) {
+  const length = payload.reduce((n, p) => n + p.length, 0);
+  const head = [...ebmlId(id), 0x01];
+  for (let i = 6; i >= 0; i--) head.push(Math.floor(length / 2 ** (8 * i)) & 0xff);
+  const out = new Uint8Array(head.length + length);
+  out.set(head, 0);
+  let at = head.length;
+  for (const p of payload) { out.set(p, at); at += p.length; }
+  return out;
+}
+
+function ebmlUintBox(id, value, width = 8) {
+  const bytes = new Uint8Array(width);
+  for (let i = width - 1, v = value; i >= 0; i--, v = Math.floor(v / 256)) bytes[i] = v & 0xff;
+  return ebmlBox(id, bytes);
+}
+
+// End of an element of unknown size: the next level-1 element.
+function ebmlUnknownEnd(bytes, from) {
+  let pos = from;
+  while (pos < bytes.length) {
+    const el = ebmlElement(bytes, pos);
+    if (!el || EBML_LEVEL1.has(el.id) || el.end === null) return pos;
+    pos = el.end;
+  }
+  return bytes.length;
+}
+
+function webmWithCues(bytes) {
+  const header = ebmlElement(bytes, 0);
+  if (!header || header.id !== 0x1a45dfa3 || header.end === null) return null;
+  const segment = ebmlElement(bytes, header.end);
+  if (!segment || segment.id !== EBML.Segment) return null;
+  const segmentEnd = segment.end === null ? bytes.length : Math.min(segment.end, bytes.length);
+
+  let info = null, tracks = null;
+  const clusters = [];
+  for (let pos = segment.data; pos < segmentEnd;) {
+    const el = ebmlElement(bytes, pos);
+    if (!el) break;
+    const end = el.end === null ? ebmlUnknownEnd(bytes, el.data) : Math.min(el.end, segmentEnd);
+    if (el.id === EBML.Info) info = { start: pos, ...el, end };
+    else if (el.id === EBML.Tracks) tracks = { start: pos, ...el, end };
+    else if (el.id === EBML.Cluster) clusters.push({ start: pos, data: el.data, end });
+    pos = end;
+  }
+  if (!info || !tracks || clusters.length === 0) return null;
+
+  // Track to cue on: the video one, else the first.
+  let videoTrack = 0, firstTrack = 0;
+  for (let pos = tracks.data; pos < tracks.end;) {
+    const entry = ebmlElement(bytes, pos);
+    if (!entry || entry.end === null) break;
+    let number = 0, type = 0;
+    for (let p = entry.data; p < entry.end;) {
+      const child = ebmlElement(bytes, p);
+      if (!child || child.end === null) break;
+      if (child.id === EBML.TrackNumber) number = ebmlUint(bytes, child.data, child.end);
+      if (child.id === EBML.TrackType) type = ebmlUint(bytes, child.data, child.end);
+      p = child.end;
+    }
+    if (entry.id === EBML.TrackEntry && number) {
+      if (type === 1 && !videoTrack) videoTrack = number;
+      if (!firstTrack) firstTrack = number;
+    }
+    pos = entry.end;
+  }
+  const cueTrack = videoTrack || firstTrack;
+  if (!cueTrack) return null;
+
+  // Cluster timecodes, and the last block's time for the duration.
+  let lastTime = 0;
+  for (const cluster of clusters) {
+    cluster.time = 0;
+    for (let p = cluster.data; p < cluster.end;) {
+      const child = ebmlElement(bytes, p);
+      if (!child) break;
+      const childEnd = child.end === null ? cluster.end : child.end;
+      if (child.id === EBML.Timecode) cluster.time = ebmlUint(bytes, child.data, childEnd);
+      if (child.id === EBML.SimpleBlock || child.id === EBML.Block) {
+        const track = ebmlVint(bytes, child.data, false);
+        if (track) {
+          const rel = (bytes[child.data + track.length] << 24 >> 16) | bytes[child.data + track.length + 1];
+          lastTime = Math.max(lastTime, cluster.time + rel);
+        }
+      }
+      if (child.id === EBML.BlockGroup) {
+        const block = ebmlElement(bytes, child.data);
+        if (block && block.id === EBML.Block) {
+          const track = ebmlVint(bytes, block.data, false);
+          if (track) lastTime = Math.max(lastTime, cluster.time + ((bytes[block.data + track.length] << 24 >> 16) | bytes[block.data + track.length + 1]));
+        }
+      }
+      p = childEnd;
+    }
+  }
+
+  // Info without its old Duration (and Voids), plus the measured one.
+  const infoChildren = [];
+  for (let p = info.data; p < info.end;) {
+    const child = ebmlElement(bytes, p);
+    if (!child || child.end === null) break;
+    if (child.id !== EBML.Duration && child.id !== EBML.Void) infoChildren.push(bytes.subarray(p, child.end));
+    p = child.end;
+  }
+  const durationBytes = new Uint8Array(8);
+  new DataView(durationBytes.buffer).setFloat64(0, lastTime);
+  const newInfo = ebmlBox(EBML.Info, ...infoChildren, ebmlBox(EBML.Duration, durationBytes));
+  const newTracks = bytes.subarray(tracks.start, tracks.end);
+  const clusterBytes = clusters.reduce((n, c) => n + (c.end - c.start), 0);
+
+  // SeekHead size does not depend on the positions (fixed-width), so build
+  // it once with zeros to measure, then for real.
+  const seekHead = (infoAt, tracksAt, cuesAt) => ebmlBox(EBML.SeekHead,
+    ...[[EBML.Info, infoAt], [EBML.Tracks, tracksAt], [EBML.Cues, cuesAt]].map(([id, at]) =>
+      ebmlBox(EBML.Seek, ebmlBox(EBML.SeekID, new Uint8Array(ebmlId(id))), ebmlUintBox(EBML.SeekPosition, at))));
+  const seekSize = seekHead(0, 0, 0).length;
+  const infoAt = seekSize;
+  const tracksAt = infoAt + newInfo.length;
+  const clustersAt = tracksAt + newTracks.length;
+  const cuesAt = clustersAt + clusterBytes;
+
+  let at = clustersAt;
+  const cuePoints = clusters.map((c) => {
+    const point = ebmlBox(EBML.CuePoint, ebmlUintBox(EBML.CueTime, c.time),
+      ebmlBox(EBML.CueTrackPositions, ebmlUintBox(EBML.CueTrack, cueTrack, 1), ebmlUintBox(EBML.CueClusterPosition, at)));
+    at += c.end - c.start;
+    return point;
+  });
+  const cues = ebmlBox(EBML.Cues, ...cuePoints);
+
+  const segmentBody = [seekHead(infoAt, tracksAt, cuesAt), newInfo, newTracks,
+    ...clusters.map((c) => bytes.subarray(c.start, c.end)), cues];
+  return concatBytes([bytes.subarray(0, header.end), ebmlBox(EBML.Segment, ...segmentBody)]);
+}
+
+function concatBytes(parts) {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) { out.set(p, at); at += p.length; }
+  return out;
+}
+
 // Merge downloaded segments, remux to MP4, and hand the result to the browser.
 // Falls back to writing the raw transport stream when remuxing fails.
 async function writeSegmentsAsVideo(chunks, filename, progressKey, tabId, knownDuration, fragmentedMp4, sink = null) {
@@ -2234,6 +2519,7 @@ async function downloadConsolidatedStream(tabId, streamKey, filename, sink = nul
 }
 
 function linkManifestToStreams(tabId, manifestUrl, parsed) {
+  persistSoon();
   if (!tabStreams[tabId]) return;
   const domain = getDomain(manifestUrl);
   for (const [key, stream] of tabStreams[tabId]) {
@@ -2250,14 +2536,80 @@ function linkManifestToStreams(tabId, manifestUrl, parsed) {
 // can ask for.
 
 function clearTabMedia(tabId) {
+  persistSoon();
   tabGen[tabId] = (tabGen[tabId] || 0) + 1;
+  mseDropTab(tabId);
   delete tabMedia[tabId];
   delete tabStreams[tabId];
   delete tabHLS[tabId];
   delete adsHidden[tabId];
+  delete hiddenAds[tabId];
   delete tabUsesMediaSource[tabId];
   updateBadge(tabId);
 }
+
+// ── MSE capture store ──
+// mse-capture.js sends every captured chunk here as it arrives; they go to
+// IndexedDB (disk) instead of the page's memory. Chunks of a tab are dropped
+// when it navigates, is cleared or closes, and all of them at browser start.
+
+let mseDb = null;
+
+function openMseDb() {
+  if (!mseDb) {
+    mseDb = new Promise((resolve, reject) => {
+      const req = indexedDB.open("mse-capture", 1);
+      req.onupgradeneeded = () => {
+        const store = req.result.createObjectStore("chunks", { autoIncrement: true });
+        store.createIndex("group", ["tabId", "frameId", "capture", "track", "group", "seq"]);
+        store.createIndex("tab", "tabId");
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => { mseDb = null; reject(req.error); };
+    });
+  }
+  return mseDb;
+}
+
+function idbDone(tx) {
+  return new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onerror = tx.onabort = () => reject(tx.error); });
+}
+
+async function mseStoreChunk(record) {
+  const tx = (await openMseDb()).transaction("chunks", "readwrite");
+  tx.objectStore("chunks").add(record);
+  return idbDone(tx);
+}
+
+async function mseReadGroup(tabId, frameId, capture, track, group) {
+  const tx = (await openMseDb()).transaction("chunks");
+  const range = IDBKeyRange.bound([tabId, frameId, capture, track, group, 0], [tabId, frameId, capture, track, group, Infinity]);
+  const req = tx.objectStore("chunks").index("group").getAll(range);
+  return new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result.map((r) => r.bytes));
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function mseDropTab(tabId) {
+  try {
+    const tx = (await openMseDb()).transaction("chunks", "readwrite");
+    const req = tx.objectStore("chunks").index("tab").openKeyCursor(IDBKeyRange.only(tabId));
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (cursor) { tx.objectStore("chunks").delete(cursor.primaryKey); cursor.continue(); }
+    };
+    await idbDone(tx);
+  } catch {}
+}
+
+browser.runtime.onStartup.addListener(async () => {
+  try {
+    const tx = (await openMseDb()).transaction("chunks", "readwrite");
+    tx.objectStore("chunks").clear();
+    await idbDone(tx);
+  } catch {}
+});
 
 // ── MSE captures ──
 // mse-capture.js keeps the bytes in the page's frame; the background only
@@ -2293,6 +2645,13 @@ async function downloadMseCapture(tabId, url, filename, sink = null) {
   ).catch(() => null);
   if (!dump) return { error: "Capture lost — the page was closed or reloaded" };
   if (dump.error) return { error: dump.error };
+  // Spilled captures: the bytes come from the store, in append order.
+  for (const track of dump.tracks) {
+    if (!track.chunks) {
+      track.chunks = await mseReadGroup(tabId, Number(frameId), dump.capture, track.track, track.group);
+    }
+  }
+  dump.tracks = dump.tracks.filter((t) => t.chunks.length > 1); // init alone is nothing
   if (!dump.tracks.length) return { error: "Nothing captured yet — play the video first" };
 
   const base = filename.replace(/\.(mp4|webm|m4a)$/i, "");
@@ -2326,9 +2685,9 @@ async function downloadMseCapture(tabId, url, filename, sink = null) {
       const progressive = fragmentedToProgressiveMp4(bytes);
       if (progressive) bytes = progressive;
       else repairFragmentedMp4Duration(bytes);
+    } else {
+      bytes = webmWithCues(bytes) || bytes;
     }
-    // ponytail: WebM is written as init + clusters, it plays but has no seek
-    // index (Cues); rebuilding one means parsing every cluster.
     const ext = isWebm ? ".webm" : (isAudio ? ".m4a" : ".mp4");
     const name = (i > 0 || (isAudio && tracks.length > 1) ? base + ".audio" : base) + ext;
     const blobUrl = URL.createObjectURL(new Blob([bytes], { type: track.mime.split(";")[0] }));
@@ -2359,17 +2718,30 @@ const CRC_TABLE = (() => {
   return table;
 })();
 
-function crc32(bytes) {
-  let c = 0xffffffff;
+function crc32(bytes, crc = 0xffffffff) {
+  let c = crc;
   for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return c;
+}
+
+// Read in slices so a 2 GB video is never copied whole just to checksum it.
+async function blobCrc32(blob) {
+  const SLICE = 16 * 1024 * 1024;
+  let c = 0xffffffff;
+  for (let at = 0; at < blob.size; at += SLICE) {
+    c = crc32(new Uint8Array(await blob.slice(at, at + SLICE).arrayBuffer()), c);
+  }
   return (c ^ 0xffffffff) >>> 0;
 }
 
-// ponytail: plain zip, no zip64 — the whole archive must stay under 4 GB.
-// Returns null above that, and the caller saves the files one by one.
+// Stored zip. Past 4 GB (or 65535 files) it switches to zip64: the 32-bit
+// fields hold 0xFFFFFFFF and the real values move to zip64 extra fields and
+// an extra end record. The bytes stay Blobs, assembled without copying.
 async function buildZip(files) {
-  const total = files.reduce((n, f) => n + f.blob.size + 100 + f.name.length * 2, 0);
-  if (total >= 0xffffffff || files.length > 0xffff) return null;
+  const estimate = files.reduce((n, f) => n + f.blob.size + 200 + f.name.length * 3, 0);
+  const zip64 = estimate >= 0xffffffff || files.length >= 0xffff;
+  const version = zip64 ? 45 : 20;
+  const MAX32 = 0xffffffff;
 
   const now = new Date();
   const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
@@ -2387,46 +2759,84 @@ async function buildZip(files) {
     used.add(name.toLowerCase());
 
     const nameBytes = encoder.encode(name);
-    const crc = crc32(new Uint8Array(await file.blob.arrayBuffer()));
+    const crc = await blobCrc32(file.blob);
     const size = file.blob.size;
 
-    const local = new DataView(new ArrayBuffer(30));
+    const localExtra = zip64 ? 20 : 0;
+    const local = new DataView(new ArrayBuffer(30 + localExtra));
     local.setUint32(0, 0x04034b50, true);
-    local.setUint16(4, 20, true);
+    local.setUint16(4, version, true);
     local.setUint16(6, 0x0800, true); // UTF-8 names
     local.setUint16(10, dosTime, true);
     local.setUint16(12, dosDate, true);
     local.setUint32(14, crc, true);
-    local.setUint32(18, size, true);
-    local.setUint32(22, size, true);
+    local.setUint32(18, zip64 ? MAX32 : size, true);
+    local.setUint32(22, zip64 ? MAX32 : size, true);
     local.setUint16(26, nameBytes.length, true);
-    parts.push(local.buffer, nameBytes, file.blob);
+    local.setUint16(28, localExtra, true);
+    // The extra field follows the name, so it is written as its own part.
+    const localZip64 = new DataView(new ArrayBuffer(localExtra));
+    if (zip64) {
+      localZip64.setUint16(0, 0x0001, true);
+      localZip64.setUint16(2, 16, true);
+      localZip64.setBigUint64(4, BigInt(size), true);
+      localZip64.setBigUint64(12, BigInt(size), true);
+    }
+    parts.push(local.buffer.slice(0, 30), nameBytes, localZip64.buffer, file.blob);
 
+    const centralExtra = zip64 ? 28 : 0;
     const entry = new DataView(new ArrayBuffer(46));
     entry.setUint32(0, 0x02014b50, true);
-    entry.setUint16(4, 20, true);
-    entry.setUint16(6, 20, true);
+    entry.setUint16(4, version, true);
+    entry.setUint16(6, version, true);
     entry.setUint16(8, 0x0800, true);
     entry.setUint16(12, dosTime, true);
     entry.setUint16(14, dosDate, true);
     entry.setUint32(16, crc, true);
-    entry.setUint32(20, size, true);
-    entry.setUint32(24, size, true);
+    entry.setUint32(20, zip64 ? MAX32 : size, true);
+    entry.setUint32(24, zip64 ? MAX32 : size, true);
     entry.setUint16(28, nameBytes.length, true);
-    entry.setUint32(42, offset, true);
-    central.push(entry.buffer, nameBytes);
+    entry.setUint16(30, centralExtra, true);
+    entry.setUint32(42, zip64 ? MAX32 : offset, true);
+    const centralZip64 = new DataView(new ArrayBuffer(centralExtra));
+    if (zip64) {
+      centralZip64.setUint16(0, 0x0001, true);
+      centralZip64.setUint16(2, 24, true);
+      centralZip64.setBigUint64(4, BigInt(size), true);
+      centralZip64.setBigUint64(12, BigInt(size), true);
+      centralZip64.setBigUint64(20, BigInt(offset), true);
+    }
+    central.push(entry.buffer, nameBytes, centralZip64.buffer);
 
-    offset += 30 + nameBytes.length + size;
+    offset += 30 + nameBytes.length + localExtra + size;
   }
 
   const centralSize = central.reduce((n, p) => n + p.byteLength, 0);
+  const tail = [];
+  if (zip64) {
+    const record = new DataView(new ArrayBuffer(56));
+    record.setUint32(0, 0x06064b50, true);
+    record.setBigUint64(4, 44n, true);
+    record.setUint16(12, 45, true);
+    record.setUint16(14, 45, true);
+    record.setBigUint64(24, BigInt(files.length), true);
+    record.setBigUint64(32, BigInt(files.length), true);
+    record.setBigUint64(40, BigInt(centralSize), true);
+    record.setBigUint64(48, BigInt(offset), true);
+    const locator = new DataView(new ArrayBuffer(20));
+    locator.setUint32(0, 0x07064b50, true);
+    locator.setBigUint64(8, BigInt(offset + centralSize), true);
+    locator.setUint32(16, 1, true);
+    tail.push(record.buffer, locator.buffer);
+  }
   const end = new DataView(new ArrayBuffer(22));
   end.setUint32(0, 0x06054b50, true);
-  end.setUint16(8, files.length, true);
-  end.setUint16(10, files.length, true);
-  end.setUint32(12, centralSize, true);
-  end.setUint32(16, offset, true);
-  return new Blob([...parts, ...central, end.buffer], { type: "application/zip" });
+  end.setUint16(8, zip64 ? 0xffff : files.length, true);
+  end.setUint16(10, zip64 ? 0xffff : files.length, true);
+  end.setUint32(12, zip64 ? MAX32 : centralSize, true);
+  end.setUint32(16, zip64 ? MAX32 : offset, true);
+  tail.push(end.buffer);
+  return new Blob([...parts, ...central, ...tail], { type: "application/zip" });
 }
 
 // Progress of the zip being built, for the popup's bar (also sent with
@@ -2446,16 +2856,31 @@ const ZIP_ATTEMPTS = 5;
 
 async function fetchForZip(url, tabId) {
   for (let attempt = 1; ; attempt++) {
-    const resp = await mediaFetch(url, { ...tabContext(tabId), withCookies: true }, null, AbortSignal.timeout(ZIP_FILE_TIMEOUT_MS));
-    if ((resp.status === 429 || resp.status === 503) && attempt < ZIP_ATTEMPTS) {
-      const retryAfter = parseInt(resp.headers.get("Retry-After"), 10);
-      await wait(Number.isFinite(retryAfter) ? Math.min(retryAfter, 30) * 1000 : 1000 * 2 ** (attempt - 1));
-      continue;
+    if (isCancelled(url)) throw new DownloadCancelled();
+    // Registered like a segment request, so cancelling the zip aborts it,
+    // body included.
+    const ac = new AbortController();
+    if (!inflight.has(url)) inflight.set(url, new Set());
+    inflight.get(url).add(ac);
+    try {
+      const resp = await mediaFetch(url, { ...tabContext(tabId), withCookies: true }, null,
+        AbortSignal.any([ac.signal, AbortSignal.timeout(ZIP_FILE_TIMEOUT_MS)]));
+      if ((resp.status === 429 || resp.status === 503) && attempt < ZIP_ATTEMPTS) {
+        const retryAfter = parseInt(resp.headers.get("Retry-After"), 10);
+        await wait(Number.isFinite(retryAfter) ? Math.min(retryAfter, 30) * 1000 : 1000 * 2 ** (attempt - 1));
+        continue;
+      }
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      // A login wall or error page served with 200 is not the file.
+      if (/^text\/html/i.test(resp.headers.get("Content-Type") || "")) throw new Error("Got a web page instead of the file");
+      return await resp.blob();
+    } catch (err) {
+      if (isCancelled(url)) throw new DownloadCancelled();
+      throw err;
+    } finally {
+      inflight.get(url)?.delete(ac);
+      if (inflight.get(url)?.size === 0) inflight.delete(url);
     }
-    if (!resp.ok) throw new Error("HTTP " + resp.status);
-    // A login wall or error page served with 200 is not the file.
-    if (/^text\/html/i.test(resp.headers.get("Content-Type") || "")) throw new Error("Got a web page instead of the file");
-    return resp;
   }
 }
 
@@ -2464,6 +2889,12 @@ async function fetchForZip(url, tabId) {
 async function downloadAsZip(job) {
   try {
     return await buildZipJob(job);
+  } catch (err) {
+    // Rows still waiting go back to idle; one toast says the zip stopped.
+    if (err && err.cancelled) {
+      browser.runtime.sendMessage({ action: "zip_done", cancelled: true, urls: job.zipItems.map((i) => i.url) }).catch(() => {});
+    }
+    throw err;
   } finally {
     zipStatus = null;
     sendZipStatus();
@@ -2473,7 +2904,7 @@ async function downloadAsZip(job) {
 async function buildZipJob(job) {
   const sink = { files: [] };
   let failed = 0;
-  zipStatus = { filename: job.filename, total: job.zipItems.length, done: 0, failed: 0, current: "", currentUrl: null, fraction: 0, phase: "fetching" };
+  zipStatus = { jobUrl: job.url, filename: job.filename, total: job.zipItems.length, done: 0, failed: 0, current: "", currentUrl: null, fraction: 0, phase: "fetching" };
   sendZipStatus();
 
   for (const item of job.zipItems) {
@@ -2484,8 +2915,12 @@ async function buildZipJob(job) {
       const result = await executeDownload({ ...item, tabId: job.tabId, sink });
       if (result && result.error) failed++;
     } catch (err) {
+      if (isCancelled(job.url)) throw new DownloadCancelled();
       failed++;
       notifyDownload(item.url, { state: "error", error: err.message });
+    } finally {
+      // The item was flagged only to stop it along with the zip.
+      cancelled.delete(item.url);
     }
     Object.assign(zipStatus, { done: zipStatus.done + 1, failed, fraction: 0 });
     sendZipStatus();
@@ -2504,15 +2939,9 @@ async function buildZipJob(job) {
   }
 
   const zip = await buildZip(sink.files);
-  if (zip) {
-    await startDownload({ url: URL.createObjectURL(zip), filename: job.filename }, job.tabId);
-  } else {
-    for (const file of sink.files) {
-      await startDownload({ url: URL.createObjectURL(file.blob), filename: job.folder + file.name }, job.tabId);
-    }
-  }
   sink.files.length = 0;
-  done({ split: !zip });
+  await startDownload({ url: URL.createObjectURL(zip), filename: job.filename }, job.tabId);
+  done({});
   return {};
 }
 
@@ -2539,6 +2968,7 @@ async function queueUserDownload({ url, filename, tabId, pageTitle, quality }) {
 
 function enqueueDownload(downloadInfo) {
   downloadQueue.push(downloadInfo);
+  updateKeepAlive();
   processDownloadQueue();
 }
 
@@ -2568,6 +2998,7 @@ async function processDownloadQueue() {
       cancelled.delete(item.url);
       running.delete(item.url);
       activeDownloads--;
+      updateKeepAlive();
       if (activeDownloads === 0) keyCache.clear();
       browser.runtime.sendMessage({
         action: "queue_update",
@@ -2602,6 +3033,7 @@ function reportDownloadResult(url, result) {
 }
 
 async function executeDownload(item) {
+  await stateReady;
   const { url, filename, tabId, quality, sink = null } = item;
 
   // Several files fetched here and handed over as one zip
@@ -2632,8 +3064,7 @@ async function executeDownload(item) {
   // A plain file going into a zip is fetched here, with the page's Referer
   // and, outside private windows, its cookies, like the browser would.
   if (sink) {
-    const resp = await fetchForZip(url, tabId);
-    sink.files.push({ name: filename.split("/").pop(), blob: await resp.blob() });
+    sink.files.push({ name: filename.split("/").pop(), blob: await fetchForZip(url, tabId) });
     reportDownloadResult(url, {});
     return {};
   }
@@ -2657,6 +3088,7 @@ async function executeDownload(item) {
 browser.webRequest.onHeadersReceived.addListener(
   (details) => {
     if (details.tabId < 0) return;
+    persistSoon();
     const gen = tabGen[details.tabId];
     const stale = () => gen !== tabGen[details.tabId];
 
@@ -2674,6 +3106,19 @@ browser.webRequest.onHeadersReceived.addListener(
         if (name === "content-type") contentType = header.value;
         if (name === "content-length") fileSize = parseInt(header.value, 10);
       }
+    }
+
+    // Big pictures seen on the wire: galleries that load the full image in
+    // JavaScript on click never put its URL in the DOM beforehand.
+    if (contentType && /^image\/(?!svg|x-icon|vnd)/i.test(contentType)) {
+      if (currentOptions.detectImages !== false && fileSize >= NETWORK_IMAGE_MIN_BYTES) {
+        let filename = getFilenameFromUrl(url);
+        if (!/\.[a-z0-9]{3,4}$/i.test(filename)) filename += "." + contentType.split("/")[1].split(";")[0].replace("jpeg", "jpg");
+        addMediaToTab(details.tabId, {
+          url, domain: getDomain(url), filename, type: "image", size: fileSize, source: "image-net"
+        }, gen);
+      }
+      return;
     }
 
     const segmentLike = isSegment(url, contentType, fileSize);
@@ -2793,7 +3238,9 @@ browser.webRequest.onHeadersReceived.addListener(
 // ── Tab management ──
 
 browser.tabs.onRemoved.addListener((tabId) => {
+  persistSoon();
   tabGen[tabId] = (tabGen[tabId] || 0) + 1;
+  mseDropTab(tabId);
   delete tabMedia[tabId];
   delete tabStreams[tabId];
   delete tabHLS[tabId];
@@ -2802,10 +3249,12 @@ browser.tabs.onRemoved.addListener((tabId) => {
   delete tabPrivate[tabId];
   delete tabPageUrl[tabId];
   delete adsHidden[tabId];
+  delete hiddenAds[tabId];
   delete tabUsesMediaSource[tabId];
 });
 
 browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  persistSoon();
   if (changeInfo.status === "loading") {
     clearTabMedia(tabId);
   }
@@ -2817,6 +3266,7 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 // ── Message handling ──
 
 browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action !== "mse_chunk" && message.action !== "get_media") persistSoon();
   // Content script found media
   if (message.action === "media_links") {
     const tabId = sender.tab ? sender.tab.id : null;
@@ -2837,6 +3287,17 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
+  // One captured MSE chunk to store
+  if (message.action === "mse_chunk") {
+    if (sender.tab && message.bytes) {
+      mseStoreChunk({
+        tabId: sender.tab.id, frameId: sender.frameId || 0, capture: message.capture,
+        track: message.track, group: message.group, seq: message.seq, bytes: message.bytes
+      }).catch(() => {});
+    }
+    return;
+  }
+
   // A Media Source player appended segments
   if (message.action === "mse_update") {
     if (sender.tab && message.tracks && message.tracks.length) {
@@ -2848,7 +3309,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // Popup requests media list
   if (message.action === "get_media") {
-    browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => {
+    stateReady.then(() => browser.tabs.query({ active: true, currentWindow: true })).then((tabs) => {
       if (tabs[0]) {
         const tabId = tabs[0].id;
         markTabPrivacy(tabId, tabs[0].incognito);
@@ -2950,6 +3411,11 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (running.has(url)) {
       cancelled.add(url);
       abortInflight(url);
+      // A zip stops the item it is fetching too.
+      if (zipStatus && zipStatus.jobUrl === url && zipStatus.currentUrl) {
+        cancelled.add(zipStatus.currentUrl);
+        abortInflight(zipStatus.currentUrl);
+      }
     } else if (browserDownloads.has(url)) {
       browser.downloads.cancel(browserDownloads.get(url)).catch(() => {});
       browserDownloads.delete(url);

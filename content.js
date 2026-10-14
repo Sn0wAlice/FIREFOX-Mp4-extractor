@@ -137,6 +137,20 @@
     return null;
   }
 
+  // Standard ad slot sizes (IAB) plus 4chan's 300x100 board banners, and
+  // folders sites keep their banners in. A picture matching them is flagged;
+  // the background hides it (and counts it) unless ads are shown.
+  const AD_SIZES = new Set(["728x90", "970x90", "970x250", "468x60", "234x60", "320x50", "320x100",
+    "300x250", "336x280", "300x600", "160x600", "120x600", "300x100", "250x250", "200x200"]);
+  const AD_IMAGE_PATHS = /\/(contest_banners|banners?|ads?|adserver|sponsors?|promo)\//i;
+
+  function looksLikeAd(url, w, h) {
+    if (w && h && (AD_SIZES.has(w + "x" + h) || (w >= 5 * h && h <= 120))) return true;
+    try { return AD_IMAGE_PATHS.test(new URL(url).pathname); } catch { return false; }
+  }
+
+  const MAX_STYLED = 5000;
+
   function scanImages(add, found) {
     const thumbs = new Set();
     const abs = (u) => { if (!u) return null; try { return new URL(u, location.href).href; } catch { return null; } };
@@ -180,17 +194,18 @@
       if (!own) return;
       add(own, "image", {
         type: "image",
+        adLike: looksLikeAd(own, img.naturalWidth, img.naturalHeight),
         filename: imageFilename(own),
         // With srcset, naturalWidth is scaled by the chosen density.
         ...(img.naturalWidth && !img.srcset ? { resolution: { width: img.naturalWidth, height: img.naturalHeight } } : {})
       });
     });
 
-    // Inline background-image: galleries and cards often draw their picture
+    // CSS background-image: galleries and cards often draw their picture
     // this way. Same rule: a full-size link or attribute wins over the
     // background, which is otherwise kept when it is drawn big enough.
-    document.querySelectorAll('[style*="url("]').forEach((el) => {
-      const m = (el.style.backgroundImage || "").match(/url\(["']?([^"')]+)["']?\)/);
+    const background = (el, css) => {
+      const m = (css || "").match(/url\(["']?([^"')]+)["']?\)/);
       const shown = m && abs(m[1]);
       if (!shown || !/^https?:/i.test(shown)) return;
       const link = el.closest("a[href]");
@@ -205,8 +220,23 @@
       }
       const rect = el.getBoundingClientRect();
       if (Math.max(rect.width, rect.height) < minImageSize) return;
-      add(shown, "image", { type: "image", filename: imageFilename(shown) });
-    });
+      add(shown, "image", { type: "image", filename: imageFilename(shown), adLike: looksLikeAd(shown, Math.round(rect.width), Math.round(rect.height)) });
+    };
+    const inline = document.querySelectorAll('[style*="url("]');
+    inline.forEach((el) => background(el, el.style.backgroundImage));
+
+    // Backgrounds set from stylesheets need the computed style of every
+    // element, so only with deep scan on.
+    // ponytail: capped at the first MAX_STYLED elements of huge pages.
+    if (deepScan) {
+      const done = new Set(inline);
+      const all = document.body ? document.body.getElementsByTagName("*") : [];
+      for (let i = 0; i < Math.min(all.length, MAX_STYLED); i++) {
+        if (done.has(all[i])) continue;
+        const css = getComputedStyle(all[i]).backgroundImage;
+        if (css && css !== "none") background(all[i], css);
+      }
+    }
 
     // The picture the page declares as its own (article, product, post).
     // Often the only full-size reference on pages that lazy-load everything.

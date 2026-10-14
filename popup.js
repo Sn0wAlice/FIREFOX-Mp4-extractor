@@ -100,9 +100,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
     if (message.action === "zip_progress") renderZipStatus(message.status);
     if (message.action === "zip_done") {
-      if (message.error) showToast("Zip: " + message.error);
-      else showToast((message.split ? `Over 4 GB — ${message.count} files saved separately` : `Zip ready: ${message.count} files`) +
-        (message.failed ? ` (${message.failed} failed)` : ""));
+      if (message.cancelled) {
+        showToast("Zip stopped");
+        (message.urls || []).forEach((url) => {
+          if (downloadStates[url]?.state !== "done") { delete downloadStates[url]; renderDownloadState(url); }
+        });
+      } else if (message.error) showToast("Zip: " + message.error);
+      else showToast(`Zip ready: ${message.count} files` + (message.failed ? ` (${message.failed} failed)` : ""));
     }
     if (message.action === "watch_new_media") {
       // The background already queued it; only reflect that here.
@@ -112,6 +116,11 @@ document.addEventListener("DOMContentLoaded", async () => {
         renderDownloadState(message.media.url);
       }
     }
+  });
+
+  // Stop the zip being built
+  document.getElementById("zipCancel").addEventListener("click", () => {
+    if (zipJobUrl) browser.runtime.sendMessage({ action: "cancel_download", url: zipJobUrl }).catch(() => {});
   });
 
   // Search
@@ -304,8 +313,11 @@ function updateNotice(response) {
 }
 
 // "Zip — 3/6 files · dash.mp4" with the share of the whole batch done.
+let zipJobUrl = null;
+
 function renderZipStatus(status) {
   const bar = document.getElementById("zipBar");
+  zipJobUrl = status ? status.jobUrl : null;
   bar.classList.toggle("visible", !!status);
   if (!status) return;
   const zipping = status.phase === "zipping";
@@ -418,6 +430,7 @@ function getSourceLabel(media) {
   // FULL: the real picture found behind a thumbnail
   if (src === "image-full") return { label: "FULL", cls: "image" };
   if (src === "image" || src === "image-link" || src === "image-meta") return { label: "IMG", cls: "image" };
+  if (src === "image-net") return { label: "NET", cls: "image" };
   return { label: "DOM", cls: "dom" };
 }
 

@@ -10,9 +10,11 @@
   const page = window.wrappedJSObject;
   if (!page || !page.MediaSource || !page.SourceBuffer) return;
 
-  // ponytail: everything stays in this frame's memory until downloaded or
-  // cleared; a long 1080p film is several GB. Streaming to disk would need a
-  // native helper.
+  // Captured bytes are handed to the background page as they arrive and
+  // stored in its IndexedDB (on disk), so a long film does not sit in this
+  // page's memory. In a private window nothing may reach the disk: there
+  // they stay here, in memory, until downloaded or cleared.
+  const spill = !browser.extension.inIncognitoContext;
   const captures = []; // { id, tracks: [track], mediaSource }
   // Keyed by the unwrapped page object: Firefox hands the same SourceBuffer
   // over through different Xray wrappers, which never compare equal.
@@ -25,8 +27,25 @@
   // A track keeps one group per initialisation segment. A quality switch
   // appends a new init segment, so each rendition lands in its own group and
   // the biggest one is what gets saved — mixing them corrupts the file.
-  function newTrack(mime) {
-    return { mime: String(mime || ""), groups: [], current: null, seen: new Set() };
+  function newTrack(mime, capture) {
+    return { mime: String(mime || ""), groups: [], current: null, seen: new Set(), capture, index: capture.tracks.length };
+  }
+
+  // Bytes of a group: kept here, or sent to the background's store with
+  // their position so the file can be rebuilt in order.
+  function keep(track, group, bytes) {
+    if (!spill) { group.fragments.push(bytes); return; }
+    browser.runtime.sendMessage({
+      action: "mse_chunk", capture: track.capture.id, track: track.index,
+      group: group.index, seq: group.seq++, bytes
+    }).catch(() => {});
+  }
+
+  function newGroup(track, init) {
+    const group = { init, fragments: [], size: init.length, seq: 0, index: track.groups.length };
+    track.groups.push(group);
+    keep(track, group, init);
+    return group;
   }
 
   function isInitSegment(bytes, mime) {
@@ -53,18 +72,14 @@
 
   function record(track, bytes) {
     if (isInitSegment(bytes, track.mime)) {
-      track.current = track.groups.find((g) => sameBytes(g.init, bytes));
-      if (!track.current) {
-        track.current = { init: bytes, fragments: [], size: bytes.length };
-        track.groups.push(track.current);
-      }
+      track.current = track.groups.find((g) => sameBytes(g.init, bytes)) || newGroup(track, bytes);
       return;
     }
     if (!track.current) return; // no init segment seen: nothing usable
     const key = fingerprint(bytes);
     if (track.seen.has(key)) return;
     track.seen.add(key);
-    track.current.fragments.push(bytes);
+    keep(track, track.current, bytes);
     track.current.size += bytes.length;
     scheduleReport();
   }
@@ -94,7 +109,7 @@
         capture = { id: captures.length + 1, tracks: [], mediaSource: keyOf(this) };
         captures.push(capture);
       }
-      const track = newTrack(mime);
+      const track = newTrack(mime, capture);
       capture.tracks.push(track);
       trackOf.set(keyOf(sb), track);
     } catch {}
@@ -169,12 +184,14 @@
 
   browser.runtime.onMessage.addListener((message) => {
     if (message.action === "forget") {
-      // The player will not re-append its init segment, so it is kept.
+      // The player will not re-append its init segment, so it is kept (and
+      // stored again: the background dropped everything of this tab).
       for (const c of captures) {
         for (const t of c.tracks) {
           t.seen.clear();
-          t.current = t.current && { init: t.current.init, fragments: [], size: t.current.init.length };
-          t.groups = t.current ? [t.current] : [];
+          const init = t.current && t.current.init;
+          t.groups = [];
+          t.current = init ? newGroup(t, init) : null;
         }
       }
       bufferedEnd = 0;
@@ -184,10 +201,13 @@
     const capture = captures.find((c) => c.id === message.id);
     if (!capture) return Promise.resolve({ error: "Capture no longer in memory — reload and play again" });
     if (drm) return Promise.resolve({ error: "DRM protected — not supported" });
+    // Stored groups are read back by the background from its own store.
     const tracks = capture.tracks
-      .map((t) => ({ mime: t.mime, group: bestGroup(t) }))
+      .map((t) => ({ mime: t.mime, track: t.index, group: bestGroup(t) }))
       .filter((t) => t.group)
-      .map((t) => ({ mime: t.mime, chunks: [t.group.init, ...t.group.fragments] }));
-    return Promise.resolve({ tracks });
+      .map((t) => spill
+        ? { mime: t.mime, track: t.track, group: t.group.index }
+        : { mime: t.mime, chunks: [t.group.init, ...t.group.fragments] });
+    return Promise.resolve({ tracks, capture: capture.id });
   });
 })();

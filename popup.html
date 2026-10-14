@@ -238,7 +238,10 @@
     .zip-bar.visible { display: block; }
     .zip-bar-text { display: flex; justify-content: space-between; gap: 8px; font-size: 10px; color: var(--text-dim); margin-bottom: 4px; }
     .zip-bar-text span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .zip-bar-text span:last-child { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .zip-bar-text span:first-child { flex: 1; }
+    #zipPct { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .zip-cancel { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 13px; line-height: 1; padding: 0 2px; }
+    .zip-cancel:hover { color: var(--red); }
     .zip-bar-track { height: 4px; border-radius: 2px; background: var(--surface2); overflow: hidden; }
     .zip-bar-fill { height: 100%; width: 0; background: var(--accent); transition: width 0.3s ease; }
     .zip-bar.zipping .zip-bar-fill { animation: zip-pulse 1s ease-in-out infinite alternate; }
@@ -852,7 +855,7 @@
 
   <!-- Progress of a multi-file download being zipped -->
   <div class="zip-bar" id="zipBar">
-    <div class="zip-bar-text"><span id="zipLabel"></span><span id="zipPct"></span></div>
+    <div class="zip-bar-text"><span id="zipLabel"></span><span id="zipPct"></span><button class="zip-cancel" id="zipCancel" title="Stop this zip">&times;</button></div>
     <div class="zip-bar-track"><div class="zip-bar-fill" id="zipFill"></div></div>
   </div>
 
