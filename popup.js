@@ -35,7 +35,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   options = optResult.options || {};
 
   // Request media from background
-  const response = await browser.runtime.sendMessage({ action: "get_media" });
+  // Rejects when the background is not up yet; the popup must still wire its
+  // buttons below rather than die here.
+  let response = null;
+  try { response = await browser.runtime.sendMessage({ action: "get_media" }); } catch {}
   if (response && response.media) {
     allMedia = deduplicateMedia(response.media);
     pageTitle = response.pageTitle || "";
@@ -51,7 +54,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   // Trigger rescan
-  browser.runtime.sendMessage({ action: "rescan" });
+  browser.runtime.sendMessage({ action: "rescan" }).catch(() => {});
 
   // Listen for messages
   browser.runtime.onMessage.addListener((message) => {
@@ -84,9 +87,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       handleDownloadUpdate(message);
     }
     if (message.action === "watch_new_media") {
-      if (watchMode && message.media) {
+      // The background already queued it; only reflect that here.
+      if (message.media) {
         showToast(`Watch: auto-downloading ${message.media.filename}`);
-        downloadMedia(message.media);
+        downloadStates[message.media.url] = { state: "queued", progress: 0 };
+        renderDownloadState(message.media.url);
       }
     }
   });
@@ -191,7 +196,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     btn.style.transition = "transform 0.4s";
     btn.style.transform = "rotate(360deg)";
     setTimeout(() => { btn.style.transform = ""; btn.style.transition = ""; }, 400);
-    browser.runtime.sendMessage({ action: "rescan" });
+    browser.runtime.sendMessage({ action: "rescan" }).catch(() => {});
     setTimeout(() => {
       browser.runtime.sendMessage({ action: "get_media" }).then((resp) => {
         if (resp && resp.media) {
@@ -588,7 +593,7 @@ function renderMediaItem(container, media) {
     ? `<video src="${escapeHtml(media.url)}" preload="metadata" muted></video>${durOverlay}`
     : `<span class="type-icon">${isStream ? "\uD83D\uDCE1" : getTypeIcon(media.type)}</span>`;
 
-  const copyUrl = isStream ? (media.manifestUrl || media.realUrls?.[0] || media.url) : media.url;
+  const copyUrl = isStream ? (media.manifestUrl || media.firstSegmentUrl || media.url) : media.url;
 
   item.innerHTML = `
     ${progressBarHtml(dlState)}
@@ -1034,8 +1039,8 @@ function downloadBestQuality() {
 
 function trackDownload(url, downloadId) {
   const interval = setInterval(() => {
-    browser.runtime.sendMessage({ action: "download_progress", downloadId }).then((resp) => {
-      if (!resp) return;
+    browser.runtime.sendMessage({ action: "download_progress", downloadId }).catch(() => null).then((resp) => {
+      if (!resp) { clearInterval(interval); return; }
       if (resp.state === "complete") {
         downloadStates[url] = { state: "done", progress: 100 };
         renderDownloadState(url);

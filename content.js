@@ -29,6 +29,18 @@
     return document.title || "";
   }
 
+  // Inline scripts rarely change once inserted, but some pages carry megabytes
+  // of JSON in them and mutate the DOM constantly, so each one is matched once.
+  const scriptCache = new WeakMap();
+  function scriptUrls(script) {
+    let urls = scriptCache.get(script);
+    if (!urls) {
+      urls = (script.textContent || "").match(MEDIA_REGEX) || [];
+      scriptCache.set(script, urls);
+    }
+    return urls;
+  }
+
   let usesMediaSource = false;
   // Deep scan walks inline scripts, JSON-LD and same-origin iframes. It finds
   // more, and costs more on heavy pages, so it can be turned off.
@@ -36,6 +48,12 @@
   browser.storage.local.get("options").then((r) => {
     deepScan = !r.options || r.options.deepScan !== false;
   }).catch(() => {});
+  browser.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.options) {
+      const o = changes.options.newValue;
+      deepScan = !o || o.deepScan !== false;
+    }
+  });
 
   function scanPage() {
     const found = new Map();
@@ -129,13 +147,7 @@
 
     // 7. Inline scripts
     if (deepScan) document.querySelectorAll("script:not([src])").forEach((script) => {
-      const text = script.textContent;
-      if (!text) return;
-      MEDIA_REGEX.lastIndex = 0;
-      let match;
-      while ((match = MEDIA_REGEX.exec(text)) !== null) {
-        add(match[0], "script");
-      }
+      scriptUrls(script).forEach((url) => add(url, "script"));
     });
 
     // 8. Same-origin iframes
@@ -151,13 +163,7 @@
           if (s.src) add(s.src, "iframe");
         });
         doc.querySelectorAll("script:not([src])").forEach((script) => {
-          const text = script.textContent;
-          if (!text) return;
-          MEDIA_REGEX.lastIndex = 0;
-          let m;
-          while ((m = MEDIA_REGEX.exec(text)) !== null) {
-            add(m[0], "iframe-script");
-          }
+          scriptUrls(script).forEach((url) => add(url, "iframe-script"));
         });
       } catch {}
     });
@@ -198,8 +204,10 @@
   }
 
   let lastFoundUrls = new Set();
+  let mutationTimer = null;
 
   function runScan() {
+    mutationTimer = null;
     usesMediaSource = false;
     const links = scanPage();
     const pageTitle = getPageTitle();
@@ -213,7 +221,8 @@
     if (links.length > 0 && !hasNew && currentUrls.size === lastFoundUrls.size) return;
 
     lastFoundUrls = currentUrls;
-    browser.runtime.sendMessage({ action: "media_links", links, pageTitle, usesMediaSource });
+    // Rejects when the extension was reloaded under a still-open page.
+    browser.runtime.sendMessage({ action: "media_links", links, pageTitle, usesMediaSource }).catch(() => {});
   }
 
   runScan();
@@ -235,10 +244,11 @@
     runScan();
   }, 1000);
 
-  let mutationTimer = null;
+  // Throttled rather than debounced: on a page that never stops mutating
+  // (tickers, live chats) a debounce would never fire at all.
   const observer = new MutationObserver(() => {
-    clearTimeout(mutationTimer);
-    mutationTimer = setTimeout(runScan, 1500);
+    if (!mutationTimer) mutationTimer = setTimeout(runScan, 1500);
   });
-  observer.observe(document.body, { childList: true, subtree: true });
+  // documentElement, not body: XML, SVG and some viewer documents have no body.
+  if (document.documentElement) observer.observe(document.documentElement, { childList: true, subtree: true });
 })();

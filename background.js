@@ -35,6 +35,8 @@ const tabPageUrl = {};
 const downloadQueue = [];
 // Downloads the user asked to stop, keyed by the URL the popup shows
 const cancelled = new Set();
+// Downloads currently being fetched by processDownloadQueue
+const running = new Set();
 
 function isCancelled(key) { return cancelled.has(key); }
 
@@ -45,6 +47,9 @@ class DownloadCancelled extends Error {
 const adsHidden = {};
 // Tabs whose player streams through Media Source Extensions
 const tabUsesMediaSource = {};
+// Bumped whenever a tab's media is cleared, so late async results from the
+// previous page (manifest fetches, storage reads) are discarded.
+const tabGen = {};
 let activeDownloads = 0;
 let maxConcurrentDownloads = 2;
 
@@ -186,9 +191,30 @@ function isPrivateTab(tabId) {
 
 // Downloads started for a private tab are attached to the private session, so
 // they show up in the private download manager and not in normal history.
+// A blob: URL pins the whole file in memory until revoked, and this page never
+// unloads, so it is released as soon as the browser is done with the download.
+const blobUrls = new Map(); // downloadId -> blob: URL
+// Regular downloads the browser is transferring, so a cancel can reach them.
+const browserDownloads = new Map(); // popup url -> downloadId
+
+browser.downloads.onChanged.addListener((delta) => {
+  if (!delta.state || delta.state.current === "in_progress") return;
+  if (blobUrls.has(delta.id)) {
+    URL.revokeObjectURL(blobUrls.get(delta.id));
+    blobUrls.delete(delta.id);
+  }
+  for (const [url, id] of browserDownloads) {
+    if (id === delta.id) browserDownloads.delete(url);
+  }
+});
+
 function startDownload(options, tabId) {
+  const isBlob = options.url.startsWith("blob:");
   return browser.downloads.download(
     isPrivateTab(tabId) ? { ...options, incognito: true } : options
+  ).then(
+    (id) => { if (isBlob) blobUrls.set(id, options.url); return id; },
+    (err) => { if (isBlob) URL.revokeObjectURL(options.url); throw err; }
   );
 }
 
@@ -221,7 +247,11 @@ function tabContext(tabId) {
 
 // Requests made on behalf of a private tab are sent without credentials so the
 // normal-session cookie jar of the background page is never exposed to the CDN.
-async function mediaFetch(url, ctx, range) {
+// Without a deadline a server that stalls mid-response holds a queue slot
+// forever. Callers that need to abort earlier (cancel) pass their own signal.
+const FETCH_TIMEOUT_MS = 30000;
+
+async function mediaFetch(url, ctx, range, signal) {
   const referer = ctx && ctx.referer;
   if (referer) {
     const existing = pendingRequestHeaders.get(url);
@@ -234,7 +264,7 @@ async function mediaFetch(url, ctx, range) {
     }
   }
 
-  const init = {};
+  const init = { signal: signal || AbortSignal.timeout(FETCH_TIMEOUT_MS) };
   if (ctx && ctx.isPrivate) init.credentials = "omit";
   if (range) init.headers = { Range: `bytes=${range.start}-${range.start + range.length - 1}` };
 
@@ -404,6 +434,8 @@ function detectStreamType(segments) {
   return "video";
 }
 
+const MAX_STREAM_SEGMENTS = 20000;
+
 function addSegmentToStream(tabId, segmentInfo) {
   // An ad break is its own little stream; letting its segments through would
   // create a phantom entry next to the real one.
@@ -424,11 +456,22 @@ function addSegmentToStream(tabId, segmentInfo) {
       totalSize: 0,
       firstSeen: Date.now(),
       contentTypes: new Set(),
+      seen: new Set(),
       manifestUrl: null
     });
   }
 
   const stream = tabStreams[tabId].get(key);
+  // Seeks, retries and quality switches request the same segment again.
+  if (stream.seen.has(segmentInfo.url)) return;
+  stream.seen.add(segmentInfo.url);
+  // ponytail: oldest segments dropped past the cap, so a live stream left
+  // running for hours keeps only its last ~MAX_STREAM_SEGMENTS.
+  if (stream.segments.length >= MAX_STREAM_SEGMENTS) {
+    const dropped = stream.segments.shift();
+    stream.seen.delete(dropped.url);
+    stream.totalSize -= dropped.size;
+  }
   stream.segments.push({
     url: segmentInfo.url,
     size: segmentInfo.size || 0,
@@ -457,7 +500,7 @@ function updateStreamEntry(tabId, key, stream) {
 
   const mediaEntry = {
     url: streamId,
-    realUrls: stream.segments.map((s) => s.url),
+    firstSegmentUrl: stream.segments[0].url,
     domain: stream.domain,
     filename: displayName + (streamType.includes("audio") && !streamType.includes("video") ? ".aac" : ".ts"),
     type: "stream",
@@ -484,11 +527,13 @@ function updateStreamEntry(tabId, key, stream) {
 
 // ── Regular media (non-segment) ──
 
-function addMediaToTab(tabId, mediaInfo) {
+function addMediaToTab(tabId, mediaInfo, gen = tabGen[tabId]) {
   if (!isFetchableUrl(mediaInfo.url)) return;
+  if (gen !== tabGen[tabId]) return;
   if (!tabMedia[tabId]) tabMedia[tabId] = new Map();
 
   browser.storage.local.get("options").then((result) => {
+    if (gen !== tabGen[tabId] || !tabMedia[tabId]) return;
     const opts = result.options || {};
     const blacklist = opts.blacklist || [];
     if (isBlacklisted(mediaInfo.url, blacklist)) return;
@@ -547,10 +592,14 @@ function addMediaToTab(tabId, mediaInfo) {
         }
       }
     }
-  });
+  }).catch(() => {});
 }
 
+// Queued here rather than by the popup: the popup closes as soon as it loses
+// focus, and two open popups would both queue the same item.
 function notifyWatchMode(tabId, media) {
+  queueUserDownload({ url: media.url, filename: media.filename, tabId, quality: media.quality })
+    .catch(() => {});
   browser.runtime.sendMessage({
     action: "watch_new_media",
     tabId,
@@ -561,8 +610,9 @@ function notifyWatchMode(tabId, media) {
 function updateBadge(tabId) {
   const count = tabMedia[tabId] ? tabMedia[tabId].size : 0;
   const text = currentOptions.showBadge === false ? "" : (count > 0 ? String(count) : "");
-  browser.browserAction.setBadgeText({ text, tabId });
-  browser.browserAction.setBadgeBackgroundColor({ color: count > 0 ? "#7c3aed" : "#666", tabId });
+  // Rejects for a tab that has just closed.
+  browser.browserAction.setBadgeText({ text, tabId }).catch(() => {});
+  browser.browserAction.setBadgeBackgroundColor({ color: count > 0 ? "#7c3aed" : "#666", tabId }).catch(() => {});
 }
 
 // ── HLS/DASH parsing ──
@@ -570,7 +620,10 @@ function updateBadge(tabId) {
 async function parseM3U8(url, ctx) {
   try {
     const resp = await mediaFetch(url, ctx);
+    if (!resp.ok) return null;
     const text = await resp.text();
+    // An HTML error page would otherwise turn every line into a "segment".
+    if (!text.trimStart().startsWith("#EXTM3U")) return null;
     const lines = text.split("\n").map((l) => l.trim());
     const result = {
       masterUrl: url, variants: [], segments: [],
@@ -1644,6 +1697,9 @@ async function writeSegmentsAsVideo(chunks, filename, progressKey, tabId, knownD
     } else {
       reportProgress(progressKey, -1, "Remuxing to MP4...");
       fragmented = await transmuxTStoMP4(source);
+      // The raw fallback is only for a failed remux; keeping the TS alive past
+      // this point would add a full copy of the stream to the peak memory.
+      source = null;
     }
 
     // A fragmented MP4 opens as an empty movie in VLC and QuickTime, so the
@@ -1860,6 +1916,8 @@ async function importAesKey(key, ctx) {
   })();
 
   keyCache.set(key.url, pending);
+  // A transient failure must not poison every later segment of the stream.
+  pending.catch(() => keyCache.delete(key.url));
   return pending;
 }
 
@@ -1896,22 +1954,44 @@ function wait(ms) {
 // A CDN under load drops the odd segment, and refusing to write an incomplete
 // file means one such drop used to throw away the whole download. Each segment
 // gets a few spaced-out attempts before it counts as lost.
+// ponytail: fixed per-attempt deadline, not an idle timer; a segment that
+// legitimately needs over a minute on a slow link fails and is retried.
+const SEGMENT_TIMEOUT_MS = 60000;
+// In-flight segment requests per download, so a cancel interrupts them at once.
+const inflight = new Map(); // progressKey -> Set<AbortController>
+
+function abortInflight(progressKey) {
+  const set = inflight.get(progressKey);
+  if (set) set.forEach((ac) => ac.abort());
+}
+
 async function fetchSegment(segment, ctx, progressKey) {
   const range = segmentRange(segment);
   let lastError = null;
 
   for (let attempt = 1; attempt <= SEGMENT_ATTEMPTS; attempt++) {
     if (isCancelled(progressKey)) throw new DownloadCancelled();
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), SEGMENT_TIMEOUT_MS);
+    if (!inflight.has(progressKey)) inflight.set(progressKey, new Set());
+    inflight.get(progressKey).add(ac);
     try {
-      const resp = await mediaFetch(segment.url, ctx, range);
+      const resp = await mediaFetch(segment.url, ctx, range, ac.signal);
       if (!resp.ok) throw new Error("HTTP " + resp.status);
 
       const body = sliceRangeResponse(await resp.arrayBuffer(), resp.status, range);
-      return segment.key ? decryptSegment(body, segment, ctx) : body;
+      return segment.key ? await decryptSegment(body, segment, ctx) : body;
     } catch (err) {
-      if (err.cancelled) throw err;
+      if (err.cancelled || isCancelled(progressKey)) throw new DownloadCancelled();
       lastError = err;
       if (attempt < SEGMENT_ATTEMPTS) await wait(RETRY_DELAY_MS * attempt);
+    } finally {
+      clearTimeout(timer);
+      const set = inflight.get(progressKey);
+      if (set) {
+        set.delete(ac);
+        if (set.size === 0) inflight.delete(progressKey);
+      }
     }
   }
   throw lastError;
@@ -2023,6 +2103,7 @@ function linkManifestToStreams(tabId, manifestUrl, parsed) {
 // can ask for.
 
 function clearTabMedia(tabId) {
+  tabGen[tabId] = (tabGen[tabId] || 0) + 1;
   delete tabMedia[tabId];
   delete tabStreams[tabId];
   delete tabHLS[tabId];
@@ -2032,6 +2113,25 @@ function clearTabMedia(tabId) {
 }
 
 // ── Download queue management ──
+
+async function queueUserDownload({ url, filename, tabId, pageTitle, quality }) {
+  const options = currentOptions;
+
+  filename = filename || getFilenameFromUrl(url);
+  if (options.filenamePattern && options.filenamePattern !== "original") {
+    filename = buildSmartFilename(
+      { filename, domain: getDomain(url), url },
+      tabTitles[tabId] || pageTitle || "",
+      options.filenamePattern
+    );
+  }
+  if (options.downloadFolder) filename = options.downloadFolder + "/" + filename;
+
+  maxConcurrentDownloads = options.maxConcurrent || 2;
+  if (!tabId) tabId = (await browser.tabs.query({ active: true, currentWindow: true }))[0]?.id;
+
+  enqueueDownload({ url, filename, tabId, quality });
+}
 
 function enqueueDownload(downloadInfo) {
   downloadQueue.push(downloadInfo);
@@ -2050,6 +2150,7 @@ async function processDownloadQueue() {
       activeDownloads
     }).catch(() => {});
 
+    running.add(item.url);
     try {
       if (isCancelled(item.url)) {
         notifyDownload(item.url, { state: "cancelled" });
@@ -2061,7 +2162,9 @@ async function processDownloadQueue() {
       else notifyDownload(item.url, { state: "error", error: err.message });
     } finally {
       cancelled.delete(item.url);
+      running.delete(item.url);
       activeDownloads--;
+      if (activeDownloads === 0) keyCache.clear();
       browser.runtime.sendMessage({
         action: "queue_update",
         queueLength: downloadQueue.length,
@@ -2115,6 +2218,7 @@ async function executeDownload(item) {
   // Regular download — the browser owns the transfer from here, so the popup
   // follows it by download id instead of waiting on us.
   const dlId = await startDownload({ url, filename }, tabId);
+  browserDownloads.set(url, dlId);
   // The duplicate log is shared across tabs and outlives the private window,
   // so private downloads are deliberately left out of it.
   if (!isPrivateTab(tabId)) {
@@ -2130,6 +2234,8 @@ async function executeDownload(item) {
 browser.webRequest.onHeadersReceived.addListener(
   (details) => {
     if (details.tabId < 0) return;
+    const gen = tabGen[details.tabId];
+    const stale = () => gen !== tabGen[details.tabId];
 
     markTabPrivacy(details.tabId, details.incognito);
     const pageUrl = details.documentUrl || details.originUrl;
@@ -2174,9 +2280,9 @@ browser.webRequest.onHeadersReceived.addListener(
       // kilobytes is its normal size.
       if (isM3U8 && fileSize && fileSize < 50000) {
         parseM3U8(url, tabContext(details.tabId)).then((parsed) => {
-          if (!parsed) return;
+          if (!parsed || stale()) return;
           linkManifestToStreams(details.tabId, url, parsed);
-        });
+        }).catch(() => {});
         return;
       }
 
@@ -2184,7 +2290,7 @@ browser.webRequest.onHeadersReceived.addListener(
 
       if (isMPD) {
         parseMPD(url, tabContext(details.tabId)).then((parsed) => {
-          if (!parsed) return;
+          if (!parsed || stale()) return;
 
           const qualities = parsed.video.map((t) => t.height).filter(Boolean).sort((a, b) => b - a);
           addMediaToTab(details.tabId, {
@@ -2199,14 +2305,14 @@ browser.webRequest.onHeadersReceived.addListener(
             audioGroups: parsed.audio.length,
             size: fileSize,
             duration: parsed.totalDuration || null
-          });
-        });
+          }, gen);
+        }).catch(() => {});
         return;
       }
 
       if (isM3U8) {
         parseM3U8(url, tabContext(details.tabId)).then((parsed) => {
-          if (!parsed) return;
+          if (!parsed || stale()) return;
 
           linkManifestToStreams(details.tabId, url, parsed);
 
@@ -2230,7 +2336,7 @@ browser.webRequest.onHeadersReceived.addListener(
               audioGroups: parsed.audioGroups.length,
               size: fileSize,
               duration: null // Will be resolved when media playlist is parsed
-            });
+            }, gen);
           } else if (parsed.segments.length > 0) {
             addMediaToTab(details.tabId, {
               url,
@@ -2241,9 +2347,9 @@ browser.webRequest.onHeadersReceived.addListener(
               segmentCount: parsed.segments.length,
               size: fileSize,
               duration: parsed.totalDuration || null
-            });
+            }, gen);
           }
-        });
+        }).catch(() => {});
       } else {
         addMediaToTab(details.tabId, {
           url,
@@ -2264,6 +2370,7 @@ browser.webRequest.onHeadersReceived.addListener(
 // ── Tab management ──
 
 browser.tabs.onRemoved.addListener((tabId) => {
+  tabGen[tabId] = (tabGen[tabId] || 0) + 1;
   delete tabMedia[tabId];
   delete tabStreams[tabId];
   delete tabHLS[tabId];
@@ -2383,7 +2490,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
       } else {
         sendResponse({ media: [], pageTitle: "", streams: [], isPrivate: false, adsHidden: 0, usesMediaSource: false, watchMode: false, queueLength: 0, activeDownloads: 0 });
       }
-    });
+    }).catch(() => sendResponse({ media: [] }));
     return true;
   }
 
@@ -2400,12 +2507,22 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // Cancel a queued or running download
   if (message.action === "cancel_download") {
-    cancelled.add(message.url);
-    const waiting = downloadQueue.findIndex((item) => item.url === message.url);
-    if (waiting >= 0) {
-      downloadQueue.splice(waiting, 1);
-      cancelled.delete(message.url);
-      notifyDownload(message.url, { state: "cancelled" });
+    const url = message.url;
+    // Drop every queued copy; flag only a download that is really running, a
+    // stale flag would silently kill the next download of the same URL.
+    let wasQueued = false;
+    for (let i = downloadQueue.length - 1; i >= 0; i--) {
+      if (downloadQueue[i].url === url) { downloadQueue.splice(i, 1); wasQueued = true; }
+    }
+    if (running.has(url)) {
+      cancelled.add(url);
+      abortInflight(url);
+    } else if (browserDownloads.has(url)) {
+      browser.downloads.cancel(browserDownloads.get(url)).catch(() => {});
+      browserDownloads.delete(url);
+      notifyDownload(url, { state: "cancelled" });
+    } else if (wasQueued) {
+      notifyDownload(url, { state: "cancelled" });
     }
     sendResponse({ cancelled: true });
     return true;
@@ -2414,7 +2531,8 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Rescan
   if (message.action === "rescan") {
     browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => {
-      if (tabs[0]) browser.tabs.sendMessage(tabs[0].id, { action: "rescan" });
+      // No content script on about:, the PDF viewer or addons.mozilla.org.
+      if (tabs[0]) browser.tabs.sendMessage(tabs[0].id, { action: "rescan" }).catch(() => {});
     });
     return;
   }
@@ -2426,44 +2544,18 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const tabId = tabs[0].id;
         tabWatchMode[tabId] = !tabWatchMode[tabId];
         sendResponse({ watchMode: tabWatchMode[tabId] });
+      } else {
+        sendResponse(null);
       }
-    });
+    }).catch(() => sendResponse(null));
     return true;
   }
 
   // Download request (now uses queue)
   if (message.action === "download") {
-    browser.storage.local.get("options").then(async (result) => {
-      const options = result.options || {};
-
-      let filename = message.filename || getFilenameFromUrl(message.url);
-      if (options.filenamePattern && options.filenamePattern !== "original") {
-        const pageTitle = tabTitles[message.tabId] || message.pageTitle || "";
-        filename = buildSmartFilename(
-          { filename, domain: getDomain(message.url), url: message.url },
-          pageTitle,
-          options.filenamePattern
-        );
-      }
-
-      if (options.downloadFolder) {
-        filename = options.downloadFolder + "/" + filename;
-      }
-
-      // Update max concurrent from options
-      maxConcurrentDownloads = options.maxConcurrent || 2;
-
-      const tabId = message.tabId || (await browser.tabs.query({ active: true, currentWindow: true }))[0]?.id;
-
-      enqueueDownload({
-        url: message.url,
-        filename,
-        tabId,
-        quality: message.quality
-      });
-
-      sendResponse({ queued: true, queueLength: downloadQueue.length });
-    });
+    queueUserDownload(message)
+      .then(() => sendResponse({ queued: true, queueLength: downloadQueue.length }))
+      .catch((err) => sendResponse({ error: err.message }));
     return true;
   }
 
@@ -2497,15 +2589,14 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // Download progress
   if (message.action === "download_progress") {
+    // A download erased from history counts as over, or the popup polls forever.
     browser.downloads.search({ id: message.downloadId }).then((items) => {
-      if (items.length) {
-        sendResponse({
-          state: items[0].state,
-          bytesReceived: items[0].bytesReceived,
-          totalBytes: items[0].totalBytes
-        });
-      }
-    });
+      sendResponse(items.length ? {
+        state: items[0].state,
+        bytesReceived: items[0].bytesReceived,
+        totalBytes: items[0].totalBytes
+      } : { state: "interrupted" });
+    }).catch(() => sendResponse({ state: "interrupted" }));
     return true;
   }
 
