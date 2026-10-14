@@ -128,6 +128,7 @@ function getMediaType(url) {
   const videoExts = ["mp4", "webm", "mkv", "avi", "mov"];
   const audioExts = ["mp3", "m4a", "ogg", "wav", "flac"];
   const streamExts = ["m3u8", "mpd"];
+  if (/^(jpe?g|png|gif|webp|avif|bmp|jxl)$/.test(ext)) return "image";
   if (videoExts.includes(ext)) return "video";
   if (audioExts.includes(ext)) return "audio";
   if (streamExts.includes(ext)) return "stream";
@@ -208,7 +209,16 @@ browser.downloads.onChanged.addListener((delta) => {
   }
 });
 
-function startDownload(options, tabId) {
+// With a sink (a zip being built), the file is collected instead of saved.
+async function sinkFile(options, sink) {
+  const blob = await (await fetch(options.url)).blob();
+  if (options.url.startsWith("blob:")) URL.revokeObjectURL(options.url);
+  sink.files.push({ name: options.filename.split("/").pop(), blob });
+  return -1;
+}
+
+function startDownload(options, tabId, sink = null) {
+  if (sink) return sinkFile(options, sink);
   const isBlob = options.url.startsWith("blob:");
   return browser.downloads.download(
     isPrivateTab(tabId) ? { ...options, incognito: true } : options
@@ -266,6 +276,7 @@ async function mediaFetch(url, ctx, range, signal) {
 
   const init = { signal: signal || AbortSignal.timeout(FETCH_TIMEOUT_MS) };
   if (ctx && ctx.isPrivate) init.credentials = "omit";
+  else if (ctx && ctx.withCookies) init.credentials = "include";
   if (range) init.headers = { Range: `bytes=${range.start}-${range.start + range.length - 1}` };
 
   try {
@@ -550,9 +561,16 @@ function addMediaToTab(tabId, mediaInfo, gen = tabGen[tabId]) {
       if (opts.maxSize && mediaInfo.size > opts.maxSize * 1024 * 1024) return;
     }
 
-    if (!mediaInfo.quality) mediaInfo.quality = extractQuality(mediaInfo.url);
-    mediaInfo.groupHash = generateFileHash(mediaInfo.url);
-    mediaInfo.fingerprint = getContentFingerprint(mediaInfo.url);
+    if (mediaInfo.type === "image") {
+      // Pictures are told apart by their full path: galleries reuse names
+      // like large.jpg across folders, and there are no quality variants.
+      const u = new URL(mediaInfo.url);
+      mediaInfo.groupHash = mediaInfo.fingerprint = u.hostname + u.pathname + u.search;
+    } else {
+      if (!mediaInfo.quality) mediaInfo.quality = extractQuality(mediaInfo.url);
+      mediaInfo.groupHash = generateFileHash(mediaInfo.url);
+      mediaInfo.fingerprint = getContentFingerprint(mediaInfo.url);
+    }
 
     const fileHash = mediaInfo.domain + "/" + mediaInfo.filename;
     if (downloadedFiles.has(fileHash)) mediaInfo.duplicate = downloadedFiles.get(fileHash);
@@ -585,8 +603,8 @@ function addMediaToTab(tabId, mediaInfo, gen = tabGen[tabId]) {
         tabMedia[tabId].set(mediaInfo.url, mediaInfo);
         updateBadge(tabId);
 
-        // Watch mode: auto-queue new media
-        if (tabWatchMode[tabId] && !mediaInfo._watchQueued) {
+        // Watch mode: auto-queue new media (pictures are downloaded by hand)
+        if (tabWatchMode[tabId] && !mediaInfo._watchQueued && mediaInfo.type !== "image") {
           mediaInfo._watchQueued = true;
           notifyWatchMode(tabId, mediaInfo);
         }
@@ -608,7 +626,10 @@ function notifyWatchMode(tabId, media) {
 }
 
 function updateBadge(tabId) {
-  const count = tabMedia[tabId] ? tabMedia[tabId].size : 0;
+  // Pictures are left out: nearly every page has some, the badge would never
+  // go blank.
+  let count = 0;
+  for (const m of tabMedia[tabId] ? tabMedia[tabId].values() : []) if (m.type !== "image") count++;
   const text = currentOptions.showBadge === false ? "" : (count > 0 ? String(count) : "");
   // Rejects for a tab that has just closed.
   browser.browserAction.setBadgeText({ text, tabId }).catch(() => {});
@@ -980,7 +1001,7 @@ function transmuxTStoMP4(tsData) {
 // progressKey is the URL the popup shows for this item. It differs from the
 // manifest URL whenever a consolidated stream is downloaded through its
 // manifest, and reporting on the wrong key leaves the popup without a bar.
-async function downloadStream(tabId, url, filename, qualityHeight, progressKey = url) {
+async function downloadStream(tabId, url, filename, qualityHeight, progressKey = url, sink = null) {
   const ctx = tabContext(tabId);
 
   const capturedSegments = collectCapturedSegments(tabId, url);
@@ -1065,21 +1086,21 @@ async function downloadStream(tabId, url, filename, qualityHeight, progressKey =
       let mp4Filename = filename.replace(/\.(m3u8|mpd|ts|aac|m4s|ism).*$/i, ".mp4");
       if (!mp4Filename.endsWith(".mp4")) mp4Filename += ".mp4";
       const blobUrl = URL.createObjectURL(new Blob([progressive], { type: "video/mp4" }));
-      const downloadId = await startDownload({ url: blobUrl, filename: mp4Filename }, tabId);
+      const downloadId = await startDownload({ url: blobUrl, filename: mp4Filename }, tabId, sink);
       result = { downloadId, filename: mp4Filename };
     } else {
       // Join refused: same two files as before, from the bytes already here.
-      result = await writeSegmentsAsVideo([videoBytes], filename, progressKey, tabId, playlistDuration, fragmentedMp4);
-      const audio = await writeAudioRendition([audioBytes], audioSegmentUrls, filename, tabId);
+      result = await writeSegmentsAsVideo([videoBytes], filename, progressKey, tabId, playlistDuration, fragmentedMp4, sink);
+      const audio = await writeAudioRendition([audioBytes], audioSegmentUrls, filename, tabId, sink);
       result.separateAudio = true;
       result.audioFilename = audio.filename;
     }
   } else {
     result = await writeSegmentsAsVideo(
-      video.chunks, filename, progressKey, tabId, playlistDuration, fragmentedMp4
+      video.chunks, filename, progressKey, tabId, playlistDuration, fragmentedMp4, sink
     );
     if (audioSegmentUrls.length > 0) {
-      const audio = await downloadAudioRendition(audioSegmentUrls, filename, progressKey, tabId, ctx);
+      const audio = await downloadAudioRendition(audioSegmentUrls, filename, progressKey, tabId, ctx, sink);
       if (audio) {
         result.separateAudio = true;
         result.audioFilename = audio.filename;
@@ -1093,7 +1114,7 @@ async function downloadStream(tabId, url, filename, qualityHeight, progressKey =
     const written = [];
     for (let i = 0; i < subtitleTracks.length; i++) {
       try {
-        const name = await downloadSubtitleTrack(subtitleTracks[i], filename, tabId, ctx, i);
+        const name = await downloadSubtitleTrack(subtitleTracks[i], filename, tabId, ctx, i, sink);
         if (name) written.push(name);
       } catch {}
     }
@@ -1798,7 +1819,7 @@ function mergeFragmentedTracks(video, audio) {
 
 // Merge downloaded segments, remux to MP4, and hand the result to the browser.
 // Falls back to writing the raw transport stream when remuxing fails.
-async function writeSegmentsAsVideo(chunks, filename, progressKey, tabId, knownDuration, fragmentedMp4) {
+async function writeSegmentsAsVideo(chunks, filename, progressKey, tabId, knownDuration, fragmentedMp4, sink = null) {
   let source = mergeChunks(chunks);
   chunks.length = 0; // the merged copy is the only one needed from here
 
@@ -1831,7 +1852,7 @@ async function writeSegmentsAsVideo(chunks, filename, progressKey, tabId, knownD
     source = null;
 
     const mp4BlobUrl = URL.createObjectURL(new Blob([mp4Data], { type: "video/mp4" }));
-    const dlId = await startDownload({ url: mp4BlobUrl, filename: mp4Filename }, tabId);
+    const dlId = await startDownload({ url: mp4BlobUrl, filename: mp4Filename }, tabId, sink);
     return { downloadId: dlId, filename: mp4Filename };
   } catch (err) {
     if (err && err.cancelled) throw err;
@@ -1839,28 +1860,28 @@ async function writeSegmentsAsVideo(chunks, filename, progressKey, tabId, knownD
 
     const rawFilename = mp4Filename.replace(/\.mp4$/, fragmentedMp4 ? ".m4s" : ".ts");
     const rawUrl = URL.createObjectURL(new Blob([source], { type: fragmentedMp4 ? "video/mp4" : "video/mp2t" }));
-    const dlId = await startDownload({ url: rawUrl, filename: rawFilename }, tabId);
+    const dlId = await startDownload({ url: rawUrl, filename: rawFilename }, tabId, sink);
     return { downloadId: dlId, filename: rawFilename, fallback: true };
   }
 }
 
-async function downloadAudioRendition(audioSegmentUrls, filename, progressKey, tabId, ctx) {
+async function downloadAudioRendition(audioSegmentUrls, filename, progressKey, tabId, ctx, sink = null) {
   reportProgress(progressKey, -1, "Downloading separate audio track...");
 
   const { chunks } = await downloadSegmentsWithProgress(
     audioSegmentUrls, progressKey, 0, audioSegmentUrls.length, ctx
   );
   if (chunks.length === 0) return null;
-  return writeAudioRendition(chunks, audioSegmentUrls, filename, tabId);
+  return writeAudioRendition(chunks, audioSegmentUrls, filename, tabId, sink);
 }
 
-async function writeAudioRendition(chunks, audioSegmentUrls, filename, tabId) {
+async function writeAudioRendition(chunks, audioSegmentUrls, filename, tabId, sink = null) {
   const ext = /\.aac(\?|$)/i.test(audioSegmentUrls[0].url) ? ".aac" : ".m4a";
   const base = filename.replace(/\.(m3u8|mpd|ts|aac|m4a|mp4|ism).*$/i, "") || "audio";
   const audioFilename = base + ".audio" + ext;
 
   const blobUrl = URL.createObjectURL(new Blob([mergeChunks(chunks)]));
-  await startDownload({ url: blobUrl, filename: audioFilename }, tabId);
+  await startDownload({ url: blobUrl, filename: audioFilename }, tabId, sink);
   return { filename: audioFilename };
 }
 
@@ -1980,7 +2001,7 @@ function mergeWebVtt(parts) {
   return "WEBVTT\n\n" + cues.join("\n\n") + "\n";
 }
 
-async function downloadSubtitleTrack(rendition, filename, tabId, ctx, index) {
+async function downloadSubtitleTrack(rendition, filename, tabId, ctx, index, sink = null) {
   const playlist = await parseM3U8(rendition.url, ctx);
   if (!playlist || playlist.segments.length === 0) return null;
 
@@ -1999,7 +2020,7 @@ async function downloadSubtitleTrack(rendition, filename, tabId, ctx, index) {
   const subFilename = `${base}.${tag}.vtt`;
 
   const blobUrl = URL.createObjectURL(new Blob([mergeWebVtt(parts)], { type: "text/vtt" }));
-  await startDownload({ url: blobUrl, filename: subFilename }, tabId);
+  await startDownload({ url: blobUrl, filename: subFilename }, tabId, sink);
   return subFilename;
 }
 
@@ -2152,6 +2173,12 @@ async function downloadSegmentsWithProgress(segments, progressKey, startIndex, t
 }
 
 function reportProgress(url, progress, label) {
+  // The item a zip is fetching drives the zip's own bar too (segments report
+  // 0-90, the rest is remuxing).
+  if (zipStatus && url === zipStatus.currentUrl && progress >= 0) {
+    zipStatus.fraction = Math.min(1, progress / 90);
+    sendZipStatus();
+  }
   browser.runtime.sendMessage({
     action: "hls_progress",
     url,
@@ -2174,7 +2201,7 @@ function mergeChunks(chunks) {
 }
 
 // Download a consolidated auto-detected stream
-async function downloadConsolidatedStream(tabId, streamKey, filename) {
+async function downloadConsolidatedStream(tabId, streamKey, filename, sink = null) {
   const streams = tabStreams[tabId];
   if (!streams || !streams.has(streamKey)) return { error: "Stream not found" };
 
@@ -2183,7 +2210,7 @@ async function downloadConsolidatedStream(tabId, streamKey, filename) {
   const progressKey = "stream://" + streamKey;
 
   if (stream.manifestUrl) {
-    return downloadStream(tabId, stream.manifestUrl, filename, null, progressKey);
+    return downloadStream(tabId, stream.manifestUrl, filename, null, progressKey, sink);
   }
 
   const segmentUrls = stream.segments.map((s) => ({ url: s.url }));
@@ -2200,7 +2227,7 @@ async function downloadConsolidatedStream(tabId, streamKey, filename) {
   if (incomplete) return incomplete;
 
   const result = await writeSegmentsAsVideo(
-    video.chunks, filename, progressKey, tabId, 0, isFragmentedMp4Playlist(segmentUrls)
+    video.chunks, filename, progressKey, tabId, 0, isFragmentedMp4Playlist(segmentUrls), sink
   );
   result.segments = segmentUrls.length;
   return result;
@@ -2257,7 +2284,7 @@ function addMseCapture(tabId, frameId, message) {
   updateBadge(tabId);
 }
 
-async function downloadMseCapture(tabId, url, filename) {
+async function downloadMseCapture(tabId, url, filename, sink = null) {
   const [, frameId, id] = url.match(/^mse:\/\/(\d+)\/(\d+)$/) || [];
   if (!frameId) return { error: "Invalid capture" };
 
@@ -2283,7 +2310,7 @@ async function downloadMseCapture(tabId, url, filename) {
     if (progressive) {
       const name = base + ".mp4";
       const blobUrl = URL.createObjectURL(new Blob([progressive], { type: "video/mp4" }));
-      await startDownload({ url: blobUrl, filename: name }, tabId);
+      await startDownload({ url: blobUrl, filename: name }, tabId, sink);
       return { segments: 2 };
     }
     tracks = [{ mime: tracks[0].mime, chunks: [video] }, { mime: tracks[1].mime, chunks: [audio] }];
@@ -2305,7 +2332,7 @@ async function downloadMseCapture(tabId, url, filename) {
     const ext = isWebm ? ".webm" : (isAudio ? ".m4a" : ".mp4");
     const name = (i > 0 || (isAudio && tracks.length > 1) ? base + ".audio" : base) + ext;
     const blobUrl = URL.createObjectURL(new Blob([bytes], { type: track.mime.split(";")[0] }));
-    await startDownload({ url: blobUrl, filename: name }, tabId);
+    await startDownload({ url: blobUrl, filename: name }, tabId, sink);
     saved.push(name);
   }
 
@@ -2314,6 +2341,179 @@ async function downloadMseCapture(tabId, url, filename) {
     separateAudio: saved.length > 1,
     audioFilename: saved[1] || null
   };
+}
+
+// ── Zip ──
+// Stored, not compressed: video, audio and pictures are compressed already,
+// and storing lets each file stay a Blob instead of one big buffer.
+
+const ZIP_FILE_TIMEOUT_MS = 10 * 60 * 1000;
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+// ponytail: plain zip, no zip64 — the whole archive must stay under 4 GB.
+// Returns null above that, and the caller saves the files one by one.
+async function buildZip(files) {
+  const total = files.reduce((n, f) => n + f.blob.size + 100 + f.name.length * 2, 0);
+  if (total >= 0xffffffff || files.length > 0xffff) return null;
+
+  const now = new Date();
+  const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+  const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+  const encoder = new TextEncoder();
+  const used = new Set();
+  const parts = [];
+  const central = [];
+  let offset = 0;
+
+  for (const file of files) {
+    // Same name twice ("video.mp4" from two players) gets " (2)".
+    let name = file.name || "file";
+    for (let i = 2; used.has(name.toLowerCase()); i++) name = file.name.replace(/(\.[^.]*)?$/, ` (${i})$1`);
+    used.add(name.toLowerCase());
+
+    const nameBytes = encoder.encode(name);
+    const crc = crc32(new Uint8Array(await file.blob.arrayBuffer()));
+    const size = file.blob.size;
+
+    const local = new DataView(new ArrayBuffer(30));
+    local.setUint32(0, 0x04034b50, true);
+    local.setUint16(4, 20, true);
+    local.setUint16(6, 0x0800, true); // UTF-8 names
+    local.setUint16(10, dosTime, true);
+    local.setUint16(12, dosDate, true);
+    local.setUint32(14, crc, true);
+    local.setUint32(18, size, true);
+    local.setUint32(22, size, true);
+    local.setUint16(26, nameBytes.length, true);
+    parts.push(local.buffer, nameBytes, file.blob);
+
+    const entry = new DataView(new ArrayBuffer(46));
+    entry.setUint32(0, 0x02014b50, true);
+    entry.setUint16(4, 20, true);
+    entry.setUint16(6, 20, true);
+    entry.setUint16(8, 0x0800, true);
+    entry.setUint16(12, dosTime, true);
+    entry.setUint16(14, dosDate, true);
+    entry.setUint32(16, crc, true);
+    entry.setUint32(20, size, true);
+    entry.setUint32(24, size, true);
+    entry.setUint16(28, nameBytes.length, true);
+    entry.setUint32(42, offset, true);
+    central.push(entry.buffer, nameBytes);
+
+    offset += 30 + nameBytes.length + size;
+  }
+
+  const centralSize = central.reduce((n, p) => n + p.byteLength, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true);
+  end.setUint16(8, files.length, true);
+  end.setUint16(10, files.length, true);
+  end.setUint32(12, centralSize, true);
+  end.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, end.buffer], { type: "application/zip" });
+}
+
+// Progress of the zip being built, for the popup's bar (also sent with
+// get_media so a popup opened mid-way shows it).
+// ponytail: one status — two zips at once show the latest one.
+let zipStatus = null;
+
+function sendZipStatus() {
+  browser.runtime.sendMessage({ action: "zip_progress", status: zipStatus }).catch(() => {});
+}
+
+// Image hosts rate-limit hard (4chan's CDN answers 429 after a few quick
+// requests, right after the page itself loaded every picture), so a refused
+// request waits — as long as Retry-After says, or longer each time — and
+// tries again.
+const ZIP_ATTEMPTS = 5;
+
+async function fetchForZip(url, tabId) {
+  for (let attempt = 1; ; attempt++) {
+    const resp = await mediaFetch(url, { ...tabContext(tabId), withCookies: true }, null, AbortSignal.timeout(ZIP_FILE_TIMEOUT_MS));
+    if ((resp.status === 429 || resp.status === 503) && attempt < ZIP_ATTEMPTS) {
+      const retryAfter = parseInt(resp.headers.get("Retry-After"), 10);
+      await wait(Number.isFinite(retryAfter) ? Math.min(retryAfter, 30) * 1000 : 1000 * 2 ** (attempt - 1));
+      continue;
+    }
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    // A login wall or error page served with 200 is not the file.
+    if (/^text\/html/i.test(resp.headers.get("Content-Type") || "")) throw new Error("Got a web page instead of the file");
+    return resp;
+  }
+}
+
+// One queue job: every item is fetched in turn (one at a time, they all sit
+// in memory until the zip is written), then the zip is handed over once.
+async function downloadAsZip(job) {
+  try {
+    return await buildZipJob(job);
+  } finally {
+    zipStatus = null;
+    sendZipStatus();
+  }
+}
+
+async function buildZipJob(job) {
+  const sink = { files: [] };
+  let failed = 0;
+  zipStatus = { filename: job.filename, total: job.zipItems.length, done: 0, failed: 0, current: "", currentUrl: null, fraction: 0, phase: "fetching" };
+  sendZipStatus();
+
+  for (const item of job.zipItems) {
+    if (isCancelled(job.url)) throw new DownloadCancelled();
+    Object.assign(zipStatus, { current: item.filename.split("/").pop(), currentUrl: item.url, fraction: 0 });
+    sendZipStatus();
+    try {
+      const result = await executeDownload({ ...item, tabId: job.tabId, sink });
+      if (result && result.error) failed++;
+    } catch (err) {
+      failed++;
+      notifyDownload(item.url, { state: "error", error: err.message });
+    }
+    Object.assign(zipStatus, { done: zipStatus.done + 1, failed, fraction: 0 });
+    sendZipStatus();
+  }
+  Object.assign(zipStatus, { phase: "zipping", current: "", currentUrl: null });
+  sendZipStatus();
+
+  const count = sink.files.length;
+  const done = (extra) => browser.runtime.sendMessage({
+    action: "zip_done", filename: job.filename, count, failed, ...extra
+  }).catch(() => {});
+
+  if (sink.files.length === 0) {
+    done({ error: "Nothing could be downloaded" });
+    return { error: "Nothing could be downloaded" };
+  }
+
+  const zip = await buildZip(sink.files);
+  if (zip) {
+    await startDownload({ url: URL.createObjectURL(zip), filename: job.filename }, job.tabId);
+  } else {
+    for (const file of sink.files) {
+      await startDownload({ url: URL.createObjectURL(file.blob), filename: job.folder + file.name }, job.tabId);
+    }
+  }
+  sink.files.length = 0;
+  done({ split: !zip });
+  return {};
 }
 
 // ── Download queue management ──
@@ -2402,11 +2602,14 @@ function reportDownloadResult(url, result) {
 }
 
 async function executeDownload(item) {
-  const { url, filename, tabId, quality } = item;
+  const { url, filename, tabId, quality, sink = null } = item;
+
+  // Several files fetched here and handed over as one zip
+  if (url.startsWith("zip://")) return downloadAsZip(item);
 
   // Bytes captured from a Media Source Extensions player
   if (url.startsWith("mse://")) {
-    const result = await downloadMseCapture(tabId, url, filename);
+    const result = await downloadMseCapture(tabId, url, filename, sink);
     reportDownloadResult(url, result);
     return result;
   }
@@ -2414,16 +2617,25 @@ async function executeDownload(item) {
   // Consolidated stream download
   if (url.startsWith("stream://")) {
     const streamKey = url.replace("stream://", "");
-    const result = await downloadConsolidatedStream(tabId, streamKey, filename);
+    const result = await downloadConsolidatedStream(tabId, streamKey, filename, sink);
     reportDownloadResult(url, result);
     return result;
   }
 
   // HLS or DASH stream download
   if (/\.(m3u8|mpd)(\?|$)/i.test(url)) {
-    const result = await downloadStream(tabId, url, filename, quality);
+    const result = await downloadStream(tabId, url, filename, quality, url, sink);
     reportDownloadResult(url, result);
     return result;
+  }
+
+  // A plain file going into a zip is fetched here, with the page's Referer
+  // and, outside private windows, its cookies, like the browser would.
+  if (sink) {
+    const resp = await fetchForZip(url, tabId);
+    sink.files.push({ name: filename.split("/").pop(), blob: await resp.blob() });
+    reportDownloadResult(url, {});
+    return {};
   }
 
   // Regular download — the browser owns the transfer from here, so the popup
@@ -2705,7 +2917,8 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
           usesMediaSource: !!tabUsesMediaSource[tabId],
           watchMode: !!tabWatchMode[tabId],
           queueLength: downloadQueue.length,
-          activeDownloads
+          activeDownloads,
+          zipStatus
         });
       } else {
         sendResponse({ media: [], pageTitle: "", streams: [], isPrivate: false, adsHidden: 0, usesMediaSource: false, watchMode: false, queueLength: 0, activeDownloads: 0 });
@@ -2787,22 +3000,29 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const ptitle = tabTitles[tabId] || message.pageTitle || "";
       maxConcurrentDownloads = options.maxConcurrent || 2;
 
-      message.items.forEach((item, index) => {
-        let filename;
-        if (message.renamePattern) {
-          filename = applyBatchRename(item, ptitle, message.renamePattern, index, message.items.length);
-        } else {
-          filename = item.filename || getFilenameFromUrl(item.url);
-        }
+      const folder = options.downloadFolder ? options.downloadFolder + "/" : "";
+      const entries = message.items.map((item, index) => ({
+        url: item.url,
+        quality: item.quality,
+        filename: message.renamePattern
+          ? applyBatchRename(item, ptitle, message.renamePattern, index, message.items.length)
+          : item.filename || getFilenameFromUrl(item.url)
+      }));
 
-        if (options.downloadFolder) {
-          filename = options.downloadFolder + "/" + filename;
-        }
+      // Several files: one zip, so the browser asks where to save once.
+      if (entries.length > 1) {
+        const title = (ptitle || "media").replace(/[\\/:*?"<>|]+/g, "_").trim().slice(0, 60) || "media";
+        const date = new Date().toISOString().slice(0, 10);
+        enqueueDownload({
+          url: "zip://" + Date.now(), filename: `${folder}${title}_${date}.zip`,
+          tabId, zipItems: entries, folder
+        });
+        sendResponse({ queued: entries.length, zip: true });
+        return;
+      }
 
-        enqueueDownload({ url: item.url, filename, tabId, quality: item.quality });
-      });
-
-      sendResponse({ queued: message.items.length });
+      for (const entry of entries) enqueueDownload({ ...entry, filename: folder + entry.filename, tabId });
+      sendResponse({ queued: entries.length });
     });
     return true;
   }

@@ -19,6 +19,15 @@ progressive MP4 that plays in VLC and QuickTime.
   MP4 (video + audio merged). Only what has been played is captured, so the
   video has to be played to the end; WebM captures are saved as separate
   video and audio files
+- Images: the pictures of the page, with the full-size version listed instead
+  of its thumbnail (link around the thumbnail, lightbox `data-*` attributes,
+  largest `srcset` candidate, Twitter / Wikimedia / Reddit / Imgur /
+  WordPress thumbnail URLs), plus inline CSS backgrounds and the page's
+  `og:image`.
+  Icons below a minimum size are skipped
+- Batch actions (selected, all, best, rename) fetch everything in the
+  background and save one zip, so the browser asks for a location once
+  (stored zip, up to 4 GB; above that the files are saved one by one)
 - Download queue with retry and cancellation, quality grouping, batch rename,
   duplicate detection, ad filter, watch mode
 - Private windows: downloads stay in the private session, requests are sent

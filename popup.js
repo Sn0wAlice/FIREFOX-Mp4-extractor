@@ -33,6 +33,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Load options
   const optResult = await browser.storage.local.get("options");
   options = optResult.options || {};
+  // Reopen on the category tab used last, whatever browser tab this is.
+  const { lastFilter } = await browser.storage.local.get("lastFilter");
+  const lastChip = lastFilter && document.querySelector(`.chip[data-filter="${CSS.escape(lastFilter)}"]`);
+  if (lastChip) {
+    document.querySelectorAll(".chip").forEach((c) => c.classList.toggle("active", c === lastChip));
+    currentFilter = lastFilter;
+  }
   applyDefaultSort();
 
   // Request media from background
@@ -48,6 +55,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     watchMode = response.watchMode || false;
     updateWatchButton();
     updateQueueBar(response.queueLength || 0, response.activeDownloads || 0);
+    renderZipStatus(response.zipStatus);
     render();
     probeMetadata(allMedia);
   } else {
@@ -90,6 +98,12 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (message.action === "dl_update") {
       handleDownloadUpdate(message);
     }
+    if (message.action === "zip_progress") renderZipStatus(message.status);
+    if (message.action === "zip_done") {
+      if (message.error) showToast("Zip: " + message.error);
+      else showToast((message.split ? `Over 4 GB — ${message.count} files saved separately` : `Zip ready: ${message.count} files`) +
+        (message.failed ? ` (${message.failed} failed)` : ""));
+    }
     if (message.action === "watch_new_media") {
       // The background already queued it; only reflect that here.
       if (message.media) {
@@ -109,6 +123,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       document.querySelectorAll(".chip").forEach((c) => c.classList.remove("active"));
       chip.classList.add("active");
       currentFilter = chip.dataset.filter;
+      browser.storage.local.set({ lastFilter: currentFilter }).catch(() => {});
       applyDefaultSort();
       render();
     });
@@ -147,12 +162,12 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Download selected
   document.getElementById("downloadSelected").addEventListener("click", () => {
-    filteredMedia.filter((m) => selectedUrls.has(m.url)).forEach((m) => downloadMedia(m));
+    downloadBatch(filteredMedia.filter((m) => selectedUrls.has(m.url)));
   });
 
   // Download all
   document.getElementById("downloadAll").addEventListener("click", () => {
-    filteredMedia.forEach((m) => downloadMedia(m));
+    downloadBatch(filteredMedia);
   });
 
   // Download best quality
@@ -288,6 +303,22 @@ function updateNotice(response) {
   bar.classList.toggle("visible", parts.length > 0);
 }
 
+// "Zip — 3/6 files · dash.mp4" with the share of the whole batch done.
+function renderZipStatus(status) {
+  const bar = document.getElementById("zipBar");
+  bar.classList.toggle("visible", !!status);
+  if (!status) return;
+  const zipping = status.phase === "zipping";
+  const pct = zipping ? 100 : Math.round(((status.done + status.fraction) / status.total) * 100);
+  bar.classList.toggle("zipping", zipping);
+  document.getElementById("zipLabel").textContent = zipping
+    ? `Building zip (${status.done - status.failed} files)…`
+    : `Zip — ${status.done}/${status.total} files` + (status.current ? ` · ${status.current}` : "") +
+      (status.failed ? ` · ${status.failed} failed` : "");
+  document.getElementById("zipPct").textContent = pct + "%";
+  document.getElementById("zipFill").style.width = pct + "%";
+}
+
 function updateQueueBar(queueLength, active) {
   const bar = document.getElementById("queueBar");
   if (queueLength === 0 && active === 0) {
@@ -357,6 +388,7 @@ function getTypeIcon(type) {
   if (type === "video") return "\uD83C\uDFAC";
   if (type === "audio") return "\uD83C\uDFB5";
   if (type === "stream") return "\uD83D\uDCE1";
+  if (type === "image") return "\uD83D\uDDBC";
   return "\uD83D\uDCC1";
 }
 
@@ -383,6 +415,9 @@ function getSourceLabel(media) {
   if (src === "hls-master" || src === "hls-media") return { label: "HLS", cls: "hls" };
   if (src === "auto-detected") return { label: "AUTO", cls: "auto" };
   if (src === "mse") return { label: "MSE", cls: "mse" };
+  // FULL: the real picture found behind a thumbnail
+  if (src === "image-full") return { label: "FULL", cls: "image" };
+  if (src === "image" || src === "image-link" || src === "image-meta") return { label: "IMG", cls: "image" };
   return { label: "DOM", cls: "dom" };
 }
 
@@ -527,10 +562,12 @@ function render() {
   const videoCount = allMedia.filter((m) => m.type === "video").length;
   const audioCount = allMedia.filter((m) => m.type === "audio").length;
   const streamCount = allMedia.filter((m) => m.type === "stream").length;
+  const imageCount = allMedia.filter((m) => m.type === "image").length;
   document.getElementById("mediaCount").textContent = `${allMedia.length} media found`;
   document.getElementById("videoCount").textContent = videoCount;
   document.getElementById("audioCount").textContent = audioCount;
   document.getElementById("streamCount").textContent = streamCount;
+  document.getElementById("imageCount").textContent = imageCount;
 
   const list = document.getElementById("mediaList");
 
@@ -598,9 +635,13 @@ function renderMediaItem(container, media) {
       ? `<span class="tag stream">HLS</span>`
       : `<span class="tag ${media.type}">${getExtension(media.filename) || media.type.toUpperCase()}</span>`;
 
-  const thumbHtml = !isStream && !media.isMseCapture && media.type === "video" && options.showThumbnails !== false
-    ? `<video src="${escapeHtml(media.url)}" preload="metadata" muted></video>${durOverlay}`
-    : `<span class="type-icon">${isStream ? "\uD83D\uDCE1" : getTypeIcon(media.type)}</span>`;
+  const isImage = media.type === "image";
+  // The thumbnail the page itself shows is the cheap preview of a full picture.
+  const thumbHtml = isImage && options.showThumbnails !== false
+    ? `<img src="${escapeHtml(media.thumbUrl || media.url)}" loading="lazy" alt="">`
+    : !isStream && !media.isMseCapture && media.type === "video" && options.showThumbnails !== false
+      ? `<video src="${escapeHtml(media.url)}" preload="metadata" muted></video>${durOverlay}`
+      : `<span class="type-icon">${isStream ? "\uD83D\uDCE1" : getTypeIcon(media.type)}</span>`;
 
   const mseHtml = media.isMseCapture ? `<span class="mse-coverage">${mseCoverageText(media)}</span>` : "";
 
@@ -636,7 +677,7 @@ function renderMediaItem(container, media) {
 
   // Checkbox
   const checkbox = item.querySelector(".media-check");
-  checkbox.addEventListener("change", () => {
+  if (checkbox) checkbox.addEventListener("change", () => {
     if (checkbox.checked) selectedUrls.add(media.url);
     else selectedUrls.delete(media.url);
     updateFooter();
@@ -832,12 +873,10 @@ function updateCheckboxes() {
 function updateFooter() {
   const selCount = selectedUrls.size;
   const totalCount = filteredMedia.length;
-
-  document.getElementById("downloadAll").disabled = totalCount === 0;
+  for (const id of ["downloadAll", "downloadBest", "batchRenameBtn", "exportBtn"]) {
+    document.getElementById(id).disabled = totalCount === 0;
+  }
   document.getElementById("downloadSelected").disabled = selCount === 0;
-  document.getElementById("downloadBest").disabled = totalCount === 0;
-  document.getElementById("batchRenameBtn").disabled = totalCount === 0;
-  document.getElementById("exportBtn").disabled = totalCount === 0;
 
   document.getElementById("downloadSelected").textContent = selCount > 0 ? `DL (${selCount})` : "DL Selected";
 
@@ -1058,9 +1097,31 @@ function downloadBestQuality() {
     }
   });
 
-  const bestItems = Array.from(bestByFingerprint.values());
-  showToast(`Downloading ${bestItems.length} best quality files`);
-  bestItems.forEach((m) => downloadMedia(m));
+  downloadBatch(Array.from(bestByFingerprint.values()));
+}
+
+// Several files go out as one zip built by the background page, so the
+// browser asks for a location once instead of once per file.
+function downloadBatch(items, renamePattern = null) {
+  items = items.filter((m) => !["downloading", "queued"].includes(downloadStates[m.url]?.state));
+  if (items.length === 0) return;
+  if (items.length === 1 && !renamePattern) { downloadMedia(items[0]); return; }
+
+  browser.runtime.sendMessage({
+    action: "batch_download",
+    items: items.map((m) => ({ url: m.url, filename: m.filename, quality: m.quality, domain: m.domain })),
+    renamePattern,
+    pageTitle
+  }).then((resp) => {
+    if (!resp || !resp.queued) return;
+    showToast(resp.zip
+      ? `Fetching ${resp.queued} files — saved as one zip when done`
+      : `${resp.queued} download(s) queued`);
+    items.forEach((m) => {
+      downloadStates[m.url] = { state: "queued", progress: 0 };
+      renderDownloadState(m.url);
+    });
+  }).catch(() => {});
 }
 
 // Each category tab opens on the sort order chosen for it in the settings.
@@ -1157,24 +1218,5 @@ function executeBatchRename() {
     : filteredMedia;
 
   document.getElementById("renameModal").classList.remove("active");
-
-  browser.runtime.sendMessage({
-    action: "batch_download",
-    items: items.map((m) => ({
-      url: m.url,
-      filename: m.filename,
-      quality: m.quality,
-      domain: m.domain
-    })),
-    renamePattern: pattern,
-    pageTitle
-  }).then((resp) => {
-    if (resp && resp.queued) {
-      showToast(`${resp.queued} downloads queued with custom names`);
-      items.forEach((m) => {
-        downloadStates[m.url] = { state: "queued", progress: 0 };
-        renderDownloadState(m.url);
-      });
-    }
-  });
+  downloadBatch(items, pattern);
 }

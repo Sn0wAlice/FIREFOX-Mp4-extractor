@@ -17,13 +17,15 @@ const DEFAULTS = {
   hideAds: true,
   maxConcurrent: 2,
   defaultRenamePattern: "{title}_{quality}_{index}",
-  sortDefaults: { all: "name", video: "name", audio: "name", stream: "name" },
+  sortDefaults: { all: "name", video: "name", audio: "name", stream: "name", image: "name" },
+  detectImages: true,
+  minImageSize: 150,
   blacklist: []
 };
 
 // Must match the sort options of the popup.
 const SORT_CHOICES = { name: "Name", size: "Size", type: "Type", domain: "Domain", quality: "Quality" };
-const SORT_CATEGORIES = { all: "All", video: "Video", audio: "Audio", stream: "Stream" };
+const SORT_CATEGORIES = { all: "All", video: "Video", audio: "Audio", stream: "Stream", image: "Image" };
 
 function buildSortFields() {
   const container = document.getElementById("sortDefaults");
@@ -70,6 +72,8 @@ function loadOptions() {
     document.getElementById("smartDedup").checked = opts.smartDedup !== false;
     document.getElementById("showSource").checked = opts.showSource !== false;
     document.getElementById("hideAds").checked = opts.hideAds !== false;
+    document.getElementById("detectImages").checked = opts.detectImages !== false;
+    document.getElementById("minImageSize").value = Number.isFinite(opts.minImageSize) ? opts.minImageSize : 150;
     document.getElementById("maxConcurrent").value = opts.maxConcurrent || 2;
     document.getElementById("defaultRenamePattern").value = opts.defaultRenamePattern || "{title}_{quality}_{index}";
 
@@ -117,6 +121,8 @@ function saveOptions() {
     smartDedup: document.getElementById("smartDedup").checked,
     showSource: document.getElementById("showSource").checked,
     hideAds: document.getElementById("hideAds").checked,
+    detectImages: document.getElementById("detectImages").checked,
+    minImageSize: Math.max(0, parseInt(document.getElementById("minImageSize").value, 10) || 0),
     maxConcurrent: parseInt(document.getElementById("maxConcurrent").value) || 2,
     defaultRenamePattern: document.getElementById("defaultRenamePattern").value || "{title}_{quality}_{index}",
     blacklist: currentBlacklist

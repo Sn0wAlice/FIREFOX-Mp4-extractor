@@ -187,6 +187,7 @@
     .stat-dot.video { background: var(--blue); }
     .stat-dot.audio { background: var(--green); }
     .stat-dot.stream { background: var(--orange); }
+    .stat-dot.image { background: var(--cyan); }
 
     .stats-right { display: flex; gap: 6px; align-items: center; }
 
@@ -232,6 +233,16 @@
     }
 
     .queue-bar.visible { display: flex; }
+
+    .zip-bar { display: none; padding: 6px 16px; border-bottom: 1px solid var(--border); background: var(--surface); }
+    .zip-bar.visible { display: block; }
+    .zip-bar-text { display: flex; justify-content: space-between; gap: 8px; font-size: 10px; color: var(--text-dim); margin-bottom: 4px; }
+    .zip-bar-text span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .zip-bar-text span:last-child { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .zip-bar-track { height: 4px; border-radius: 2px; background: var(--surface2); overflow: hidden; }
+    .zip-bar-fill { height: 100%; width: 0; background: var(--accent); transition: width 0.3s ease; }
+    .zip-bar.zipping .zip-bar-fill { animation: zip-pulse 1s ease-in-out infinite alternate; }
+    @keyframes zip-pulse { from { opacity: 1; } to { opacity: 0.45; } }
 
     .queue-bar .queue-count {
       background: var(--accent);
@@ -372,6 +383,9 @@
     .tag.video { color: var(--blue); }
     .tag.audio { color: var(--green); }
     .tag.stream { color: var(--orange); }
+    .tag.image { color: var(--cyan); }
+    .source-badge.image { background: var(--cyan); color: white; }
+    .media-thumb img { width: 100%; height: 100%; object-fit: cover; }
 
     .quality-badge {
       padding: 1px 5px;
@@ -794,6 +808,7 @@
         <button class="chip" data-filter="video">Video</button>
         <button class="chip" data-filter="audio">Audio</button>
         <button class="chip" data-filter="stream">Stream</button>
+        <button class="chip" data-filter="image">Image</button>
       </div>
     </div>
   </div>
@@ -808,6 +823,7 @@
       <div class="stat-item"><div class="stat-dot video"></div><span id="videoCount">0</span></div>
       <div class="stat-item"><div class="stat-dot audio"></div><span id="audioCount">0</span></div>
       <div class="stat-item"><div class="stat-dot stream"></div><span id="streamCount">0</span></div>
+      <div class="stat-item"><div class="stat-dot image"></div><span id="imageCount">0</span></div>
     </div>
     <div class="stats-right">
       <div class="size-filter">
@@ -832,6 +848,12 @@
     <span>Queue:</span>
     <span class="queue-count" id="queueCount">0</span>
     <span id="queueInfo">downloads pending</span>
+  </div>
+
+  <!-- Progress of a multi-file download being zipped -->
+  <div class="zip-bar" id="zipBar">
+    <div class="zip-bar-text"><span id="zipLabel"></span><span id="zipPct"></span></div>
+    <div class="zip-bar-track"><div class="zip-bar-fill" id="zipFill"></div></div>
   </div>
 
   <!-- Media list -->

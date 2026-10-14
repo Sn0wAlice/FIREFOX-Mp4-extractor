@@ -45,15 +45,191 @@
   // Deep scan walks inline scripts, JSON-LD and same-origin iframes. It finds
   // more, and costs more on heavy pages, so it can be turned off.
   let deepScan = true;
-  browser.storage.local.get("options").then((r) => {
-    deepScan = !r.options || r.options.deepScan !== false;
-  }).catch(() => {});
+  let detectImages = true;
+  let minImageSize = 150;
+  function readOptions(o) {
+    deepScan = !o || o.deepScan !== false;
+    detectImages = !o || o.detectImages !== false;
+    minImageSize = o && Number.isFinite(o.minImageSize) ? o.minImageSize : 150;
+  }
+  browser.storage.local.get("options").then((r) => readOptions(r.options)).catch(() => {});
   browser.storage.onChanged.addListener((changes, area) => {
-    if (area === "local" && changes.options) {
-      const o = changes.options.newValue;
-      deepScan = !o || o.deepScan !== false;
-    }
+    if (area === "local" && changes.options) readOptions(changes.options.newValue);
   });
+
+  // ── Images ──
+  // A board or gallery shows a small thumbnail and keeps the real picture one
+  // click away. The thumbnail is never what the user wants, so for every <img>
+  // the full-size version is looked for first and the thumbnail is dropped
+  // when one is found.
+
+  const IMAGE_EXT = /\.(jpe?g|png|gif|webp|avif|bmp|jxl)(\?|#|$)/i;
+  // Attributes sites use to point at the full-size picture (lightbox, zoom,
+  // WordPress attachments, lazy loaders).
+  const FULL_ATTRS = [
+    "data-full", "data-full-url", "data-fullsrc", "data-full-src", "data-original",
+    "data-orig-file", "data-orig-src", "data-large-file", "data-large", "data-zoom-image",
+    "data-zoom-src", "data-hires", "data-highres", "data-big", "data-image-full", "data-lightbox-src"
+  ];
+  const LAZY_ATTRS = ["data-src", "data-lazy-src", "data-lazy", "data-url"];
+
+  // URL rules of large image hosts whose thumbnails are a fixed rewrite of
+  // the original. Only rules known to be exact live here: a guessed URL
+  // that does not exist would replace a working thumbnail with nothing.
+  function knownOriginal(url) {
+    try {
+      const u = new URL(url);
+      if (u.hostname === "pbs.twimg.com" && u.searchParams.has("name")) {
+        u.searchParams.set("name", "orig");
+        return u.href;
+      }
+      if (u.hostname === "upload.wikimedia.org" && u.pathname.includes("/thumb/")) {
+        // /wikipedia/commons/thumb/a/ab/File.jpg/220px-File.jpg
+        const m = u.pathname.match(/^(.*)\/thumb(\/.+)\/[^/]+$/);
+        if (m) return u.origin + m[1] + m[2];
+      }
+      if (u.hostname === "preview.redd.it") {
+        return "https://i.redd.it" + u.pathname;
+      }
+      // Imgur: a 7-character id plus a size letter (s, b, t, m, l, h).
+      if (u.hostname === "i.imgur.com") {
+        const m = u.pathname.match(/^\/([A-Za-z0-9]{7})[sbtmlh](\.[a-z]+)$/);
+        if (m) return u.origin + "/" + m[1] + m[2];
+      }
+      // WordPress keeps the uploaded original next to its resized copies
+      // (photo-300x200.jpg). Limited to its uploads folder: elsewhere a
+      // -WxH suffix can be part of the real name.
+      if (u.pathname.includes("/wp-content/uploads/")) {
+        const stripped = u.pathname.replace(/-\d{2,5}x\d{2,5}(\.[a-z]+)$/i, "$1");
+        if (stripped !== u.pathname) return u.origin + stripped;
+      }
+    } catch {}
+    return null;
+  }
+
+  // Largest candidate of a srcset, by width descriptor or density.
+  function largestFromSrcset(srcset) {
+    let best = null, bestScore = 0;
+    for (const part of (srcset || "").split(/,\s+/)) {
+      const [url, desc = "1x"] = part.trim().split(/\s+/);
+      if (!url) continue;
+      const score = parseFloat(desc) * (desc.endsWith("w") ? 1 : 1000);
+      if (score > bestScore) { best = url; bestScore = score; }
+    }
+    return best;
+  }
+
+  // Some hosts serve pictures from extensionless URLs (?format=jpg); the
+  // saved file still needs one.
+  function imageFilename(url) {
+    const name = getFilename(url);
+    if (/\.[a-z0-9]{3,4}$/i.test(name)) return name;
+    let ext = "jpg";
+    try { ext = new URL(url).searchParams.get("format") || ext; } catch {}
+    return name + "." + ext;
+  }
+
+  function attrUrl(el, names) {
+    for (const name of names) {
+      const v = el && el.getAttribute(name);
+      if (v && !v.startsWith("data:")) return v;
+    }
+    return null;
+  }
+
+  function scanImages(add, found) {
+    const thumbs = new Set();
+    const abs = (u) => { if (!u) return null; try { return new URL(u, location.href).href; } catch { return null; } };
+
+    document.querySelectorAll("img").forEach((img) => {
+      const shown = img.currentSrc || img.src;
+      const shownOk = shown && /^https?:/i.test(shown);
+      const link = img.closest("a[href]");
+
+      // A thumbnail linking to a video: the video is the media, not the picture.
+      if (link && MEDIA_REGEX.test(link.href)) {
+        MEDIA_REGEX.lastIndex = 0;
+        if (shownOk) thumbs.add(shown);
+        return;
+      }
+      MEDIA_REGEX.lastIndex = 0;
+
+      const full = abs(
+        (link && IMAGE_EXT.test(link.href) && link.href) ||
+        attrUrl(img, FULL_ATTRS) || attrUrl(link, FULL_ATTRS) ||
+        (shownOk && knownOriginal(shown)) ||
+        largestFromSrcset(img.getAttribute("srcset") || img.closest("picture")?.querySelector("source")?.getAttribute("srcset"))
+      );
+
+      if (full && full !== shown) {
+        add(full, "image-full", { type: "image", filename: imageFilename(full), thumbUrl: shownOk ? shown : null });
+        if (shownOk) thumbs.add(shown);
+        return;
+      }
+
+      // No bigger version: the picture as shown, or its lazy source while it
+      // still shows a placeholder (its size is unknown, lazy loading is used
+      // for content pictures, not icons).
+      if (shownOk) {
+        // Size unknown until loaded; the load listener rescans then.
+        if (!img.complete || !img.naturalWidth) return;
+        // Icons, avatars, emoji, tracking pixels.
+        if (Math.max(img.naturalWidth, img.naturalHeight) < minImageSize) return;
+      }
+      const own = shownOk ? shown : abs(attrUrl(img, LAZY_ATTRS));
+      if (!own) return;
+      add(own, "image", {
+        type: "image",
+        filename: imageFilename(own),
+        // With srcset, naturalWidth is scaled by the chosen density.
+        ...(img.naturalWidth && !img.srcset ? { resolution: { width: img.naturalWidth, height: img.naturalHeight } } : {})
+      });
+    });
+
+    // Inline background-image: galleries and cards often draw their picture
+    // this way. Same rule: a full-size link or attribute wins over the
+    // background, which is otherwise kept when it is drawn big enough.
+    document.querySelectorAll('[style*="url("]').forEach((el) => {
+      const m = (el.style.backgroundImage || "").match(/url\(["']?([^"')]+)["']?\)/);
+      const shown = m && abs(m[1]);
+      if (!shown || !/^https?:/i.test(shown)) return;
+      const link = el.closest("a[href]");
+      const full = abs(
+        (link && IMAGE_EXT.test(link.href) && link.href) ||
+        attrUrl(el, FULL_ATTRS) || attrUrl(link, FULL_ATTRS) || knownOriginal(shown)
+      );
+      if (full && full !== shown) {
+        add(full, "image-full", { type: "image", filename: imageFilename(full), thumbUrl: shown });
+        thumbs.add(shown);
+        return;
+      }
+      const rect = el.getBoundingClientRect();
+      if (Math.max(rect.width, rect.height) < minImageSize) return;
+      add(shown, "image", { type: "image", filename: imageFilename(shown) });
+    });
+
+    // The picture the page declares as its own (article, product, post).
+    // Often the only full-size reference on pages that lazy-load everything.
+    const declared = document.querySelector('meta[property="og:image"], meta[property="og:image:url"], meta[name="twitter:image"], meta[name="twitter:image:src"]');
+    const declaredUrl = declared && abs(declared.getAttribute("content"));
+    if (declaredUrl) {
+      const width = parseInt(document.querySelector('meta[property="og:image:width"]')?.getAttribute("content"), 10);
+      if (!(width < minImageSize)) {
+        add(declaredUrl, "image-meta", { type: "image", filename: imageFilename(declaredUrl) });
+      }
+    }
+
+    // Plain links straight to a picture ("view full size", "original").
+    document.querySelectorAll("a[href]").forEach((a) => {
+      if (IMAGE_EXT.test(a.href) && !a.querySelector("img")) add(a.href, "image-link", { type: "image", filename: imageFilename(a.href) });
+    });
+
+    // A thumbnail may also have been added by another <img> using it.
+    for (const url of thumbs) {
+      const entry = found.get(url);
+      if (entry && entry.type === "image" && entry.source !== "image-full") found.delete(url);
+    }
+  }
 
   function scanPage() {
     const found = new Map();
@@ -176,6 +352,9 @@
       } catch {}
     });
 
+    // 11. Images, with the full-size version preferred over the thumbnail
+    if (detectImages) scanImages(add, found);
+
     // 10. Meta tags
     document.querySelectorAll('meta[property^="og:video"], meta[property^="og:audio"], meta[name="twitter:player:stream"]').forEach((meta) => {
       const url = meta.getAttribute("content");
@@ -249,6 +428,11 @@
   const observer = new MutationObserver(() => {
     if (!mutationTimer) mutationTimer = setTimeout(runScan, 1500);
   });
+  // A picture's size is only known once loaded, which no DOM mutation reports.
+  document.addEventListener("load", (e) => {
+    if (detectImages && e.target.tagName === "IMG" && !mutationTimer) mutationTimer = setTimeout(runScan, 1500);
+  }, true);
+
   // documentElement, not body: XML, SVG and some viewer documents have no body.
   if (document.documentElement) observer.observe(document.documentElement, { childList: true, subtree: true });
 })();
