@@ -33,6 +33,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Load options
   const optResult = await browser.storage.local.get("options");
   options = optResult.options || {};
+  applyDefaultSort();
 
   // Request media from background
   // Rejects when the background is not up yet; the popup must still wire its
@@ -105,6 +106,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       document.querySelectorAll(".chip").forEach((c) => c.classList.remove("active"));
       chip.classList.add("active");
       currentFilter = chip.dataset.filter;
+      applyDefaultSort();
       render();
     });
   });
@@ -1035,6 +1037,14 @@ function downloadBestQuality() {
   const bestItems = Array.from(bestByFingerprint.values());
   showToast(`Downloading ${bestItems.length} best quality files`);
   bestItems.forEach((m) => downloadMedia(m));
+}
+
+// Each category tab opens on the sort order chosen for it in the settings.
+function applyDefaultSort() {
+  const sort = options.sortDefaults && options.sortDefaults[currentFilter];
+  if (!sort) return;
+  currentSort = sort;
+  document.getElementById("sortSelect").value = sort;
 }
 
 function trackDownload(url, downloadId) {

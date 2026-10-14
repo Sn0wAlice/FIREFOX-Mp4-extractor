@@ -17,8 +17,30 @@ const DEFAULTS = {
   hideAds: true,
   maxConcurrent: 2,
   defaultRenamePattern: "{title}_{quality}_{index}",
+  sortDefaults: { all: "name", video: "name", audio: "name", stream: "name" },
   blacklist: []
 };
+
+// Must match the sort options of the popup.
+const SORT_CHOICES = { name: "Name", size: "Size", type: "Type", domain: "Domain", quality: "Quality" };
+const SORT_CATEGORIES = { all: "All", video: "Video", audio: "Audio", stream: "Stream" };
+
+function buildSortFields() {
+  const container = document.getElementById("sortDefaults");
+  for (const [cat, label] of Object.entries(SORT_CATEGORIES)) {
+    const field = document.createElement("div");
+    field.className = "field";
+    const lbl = document.createElement("label");
+    lbl.textContent = label;
+    lbl.htmlFor = "sort-" + cat;
+    const select = document.createElement("select");
+    select.id = "sort-" + cat;
+    select.dataset.sortCat = cat;
+    for (const [value, text] of Object.entries(SORT_CHOICES)) select.add(new Option(text, value));
+    field.append(lbl, select);
+    container.appendChild(field);
+  }
+}
 
 let currentBlacklist = [];
 
@@ -51,6 +73,11 @@ function loadOptions() {
     document.getElementById("maxConcurrent").value = opts.maxConcurrent || 2;
     document.getElementById("defaultRenamePattern").value = opts.defaultRenamePattern || "{title}_{quality}_{index}";
 
+    const sortDefaults = { ...DEFAULTS.sortDefaults, ...opts.sortDefaults };
+    document.querySelectorAll("[data-sort-cat]").forEach((sel) => {
+      sel.value = sortDefaults[sel.dataset.sortCat];
+    });
+
     // Formats
     const enabledFormats = opts.formats || DEFAULTS.formats;
     document.querySelectorAll("[data-fmt]").forEach((cb) => {
@@ -69,7 +96,13 @@ function saveOptions() {
     if (cb.checked) formats.push(cb.dataset.fmt);
   });
 
+  const sortDefaults = {};
+  document.querySelectorAll("[data-sort-cat]").forEach((sel) => {
+    sortDefaults[sel.dataset.sortCat] = sel.value;
+  });
+
   const options = {
+    sortDefaults,
     downloadFolder: document.getElementById("downloadFolder").value.trim(),
     filenamePattern: document.getElementById("filenamePattern").value,
     minSize: parseInt(document.getElementById("minSize").value) || 0,
@@ -157,6 +190,7 @@ function escapeHtml(str) {
 // ── Init ──
 
 document.addEventListener("DOMContentLoaded", () => {
+  buildSortFields();
   loadOptions();
 
   document.getElementById("saveBtn").addEventListener("click", saveOptions);
