@@ -34,6 +34,10 @@ progressive MP4 that plays in VLC and QuickTime.
   are retried
 - Download queue with retry and cancellation, quality grouping, batch rename,
   duplicate detection, ad filter, watch mode
+- Playlist mode (☰ in the popup, on demand only): the same-site links of the
+  page (up to 40, logout/delete links and files skipped) are opened three at a
+  time in muted background tabs, and the videos detected in each are added to
+  the list with the title of their page. MSE captures are not collected
 - Private windows: downloads stay in the private session, requests are sent
   without the normal-session cookies
 
@@ -45,8 +49,13 @@ DRM-protected streams (Widevine, PlayReady, licence servers) are not supported.
 
 ## Install (development)
 
+`./build.sh dev` builds `dist/dev/`: same code under another name, id and an
+orange DEV icon, so it can be loaded next to the store version.
+
 1. Open `about:debugging#/runtime/this-firefox`
-2. Click **Load Temporary Add-on…** and pick `manifest.json`
+2. Click **Load Temporary Add-on…** and pick `dist/dev/manifest.json`
+
+`./build.sh prod` writes `dist/media-extractor-pro-<version>.zip` for AMO.
 
 ## Layout
 

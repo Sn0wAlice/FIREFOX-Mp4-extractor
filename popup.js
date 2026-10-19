@@ -15,7 +15,11 @@ let pageTitle = "";
 let currentTheme = "dark";
 let options = {};
 let watchMode = false;
-let isPrivateContext = false;
+let activeTabId = null;
+let detached = false;
+// Every message names its tab, so a detached window keeps talking about the
+// page it was opened from.
+const send = (message) => browser.runtime.sendMessage({ tabId: activeTabId, ...message });
 let sizeFilterMB = 0;
 let metadataCache = new Map(); // url -> { resolution, duration }
 
@@ -34,7 +38,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   const optResult = await browser.storage.local.get("options");
   options = optResult.options || {};
   // Reopen on the category tab used last, whatever browser tab this is.
-  const { lastFilter } = await browser.storage.local.get("lastFilter");
+  const { lastFilter, lastSearch } = await browser.storage.local.get(["lastFilter", "lastSearch"]);
+  document.getElementById("searchInput").value = lastSearch || "";
   const lastChip = lastFilter && document.querySelector(`.chip[data-filter="${CSS.escape(lastFilter)}"]`);
   if (lastChip) {
     document.querySelectorAll(".chip").forEach((c) => c.classList.toggle("active", c === lastChip));
@@ -42,20 +47,28 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
   applyDefaultSort();
 
+  // Detached into its own window: the tab is in the URL, the window's own
+  // active tab is this page.
+  detached = new URLSearchParams(location.search).has("tab");
+  activeTabId = detached
+    ? Number(new URLSearchParams(location.search).get("tab"))
+    : (await browser.tabs.query({ active: true, currentWindow: true }).catch(() => []))[0]?.id ?? null;
+  document.body.classList.toggle("detached", detached);
+
   // Request media from background
   // Rejects when the background is not up yet; the popup must still wire its
   // buttons below rather than die here.
   let response = null;
-  try { response = await browser.runtime.sendMessage({ action: "get_media" }); } catch {}
+  try { response = await send({ action: "get_media" }); } catch {}
   if (response && response.media) {
     allMedia = deduplicateMedia(response.media);
     pageTitle = response.pageTitle || "";
-    isPrivateContext = !!response.isPrivate;
     updateNotice(response);
     watchMode = response.watchMode || false;
     updateWatchButton();
     updateQueueBar(response.queueLength || 0, response.activeDownloads || 0);
     renderZipStatus(response.zipStatus);
+    renderPlaylistStatus(response.playlist);
     render();
     probeMetadata(allMedia);
   } else {
@@ -63,12 +76,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   // Trigger rescan
-  browser.runtime.sendMessage({ action: "rescan" }).catch(() => {});
+  send({ action: "rescan" }).catch(() => {});
 
   // Listen for messages
   browser.runtime.onMessage.addListener((message) => {
     if (message.action === "media_links" || message.action === "new_media" || message.action === "mse_update") {
-      browser.runtime.sendMessage({ action: "get_media" }).then((resp) => {
+      send({ action: "get_media" }).then((resp) => {
         if (resp && resp.media) {
           const newMedia = deduplicateMedia(resp.media);
           const oldUrls = new Set(allMedia.map((m) => m.url));
@@ -99,6 +112,16 @@ document.addEventListener("DOMContentLoaded", async () => {
       handleDownloadUpdate(message);
     }
     if (message.action === "zip_progress") renderZipStatus(message.status);
+    if (message.action === "playlist_progress" && message.tabId === activeTabId) renderPlaylistStatus(message.status);
+    if (message.action === "playlist_done" && message.tabId === activeTabId) {
+      // Dev builds keep the page list on screen to read it after the run.
+      if (document.getElementById("playlistDebug").hidden) renderPlaylistStatus(null);
+      else {
+        document.getElementById("playlistBtn").classList.remove("active");
+        document.getElementById("playlistLabel").textContent += message.cancelled ? " — stopped" : " — done";
+      }
+      showToast((message.cancelled ? "Playlist stopped" : "Playlist done") + ` — ${message.found} media added`);
+    }
     if (message.action === "zip_done") {
       if (message.cancelled) {
         showToast("Zip stopped");
@@ -118,13 +141,66 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   });
 
+  // Playlist mode: crawl the same-site links of the page
+  // Child-only is on by default; the base path is the current page's unless
+  // the user typed one, and the last one typed is kept.
+  const childOnlyBox = document.getElementById("playlistChildOnly");
+  const baseInput = document.getElementById("playlistBase");
+  browser.storage.local.get(["playlistChildOnly", "playlistBasePath"]).then((r) => {
+    childOnlyBox.checked = r.playlistChildOnly !== false;
+    baseInput.value = r.playlistBasePath || "";
+    baseInput.disabled = !childOnlyBox.checked;
+  });
+  childOnlyBox.addEventListener("change", () => {
+    baseInput.disabled = !childOnlyBox.checked;
+    browser.storage.local.set({ playlistChildOnly: childOnlyBox.checked });
+  });
+  baseInput.addEventListener("input", () => browser.storage.local.set({ playlistBasePath: baseInput.value.trim() }));
+  const asDir = (p) => (p.startsWith("/") ? p : "/" + p).replace(/\/?$/, "/");
+  document.getElementById("playlistBtn").addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const tab = await browser.tabs.get(activeTabId).catch(() => null);
+    let path = "";
+    try { path = new URL(tab.url).pathname; } catch {}
+    baseInput.placeholder = asDir(path);
+    document.getElementById("playlistMenu").classList.toggle("show");
+  });
+  document.getElementById("playlistMenu").addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", () => document.getElementById("playlistMenu").classList.remove("show"));
+  document.getElementById("playlistStart").addEventListener("click", async () => {
+    document.getElementById("playlistMenu").classList.remove("show");
+    const basePath = childOnlyBox.checked ? asDir(baseInput.value.trim() || baseInput.placeholder || "/") : null;
+    const resp = await send({ action: "playlist_start", basePath }).catch(() => null);
+    if (!resp || resp.error) showToast("Playlist: " + (resp ? resp.error : "unavailable"));
+    else if (!resp.count) showToast(basePath ? `Playlist: no link under ${basePath}` : "Playlist: no same-site link on this page");
+    else showToast(`Playlist: scanning ${resp.count} pages in the background`);
+  });
+  document.getElementById("playlistCancel").addEventListener("click", () => {
+    if (!document.getElementById("playlistBtn").classList.contains("active")) return renderPlaylistStatus(null);
+    send({ action: "playlist_stop" }).catch(() => {});
+  });
+
+  // Firefox closes the popup as soon as it loses focus, which a download does
+  // (downloads panel, "Save as"). A window of its own stays open.
+  document.getElementById("detachBtn").addEventListener("click", async () => {
+    if (activeTabId == null) return;
+    await browser.windows.create({
+      type: "popup", width: 600, height: 700,
+      url: browser.runtime.getURL("popup.html?tab=" + activeTabId)
+    });
+    window.close();
+  });
+
   // Stop the zip being built
   document.getElementById("zipCancel").addEventListener("click", () => {
-    if (zipJobUrl) browser.runtime.sendMessage({ action: "cancel_download", url: zipJobUrl }).catch(() => {});
+    if (zipJobUrl) send({ action: "cancel_download", url: zipJobUrl }).catch(() => {});
   });
 
   // Search
-  document.getElementById("searchInput").addEventListener("input", render);
+  document.getElementById("searchInput").addEventListener("input", (e) => {
+    browser.storage.local.set({ lastSearch: e.target.value }).catch(() => {});
+    render();
+  });
 
   // Filter chips
   document.querySelectorAll(".chip").forEach((chip) => {
@@ -197,7 +273,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Watch mode
   document.getElementById("watchBtn").addEventListener("click", async () => {
-    const resp = await browser.runtime.sendMessage({ action: "toggle_watch" });
+    const resp = await send({ action: "toggle_watch" });
     if (resp) {
       watchMode = resp.watchMode;
       updateWatchButton();
@@ -208,7 +284,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Clear everything this tab has collected. A single page application never
   // reloads, so without this the list keeps every video ever opened in it.
   document.getElementById("clearBtn").addEventListener("click", async () => {
-    await browser.runtime.sendMessage({ action: "clear_media" });
+    await send({ action: "clear_media" });
     allMedia = [];
     filteredMedia = [];
     selectedUrls.clear();
@@ -225,9 +301,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     btn.style.transition = "transform 0.4s";
     btn.style.transform = "rotate(360deg)";
     setTimeout(() => { btn.style.transform = ""; btn.style.transition = ""; }, 400);
-    browser.runtime.sendMessage({ action: "rescan" }).catch(() => {});
+    send({ action: "rescan" }).catch(() => {});
     setTimeout(() => {
-      browser.runtime.sendMessage({ action: "get_media" }).then((resp) => {
+      send({ action: "get_media" }).then((resp) => {
         if (resp && resp.media) {
           allMedia = deduplicateMedia(resp.media);
           if (resp.pageTitle) pageTitle = resp.pageTitle;
@@ -329,6 +405,25 @@ function renderZipStatus(status) {
       (status.failed ? ` · ${status.failed} failed` : "");
   document.getElementById("zipPct").textContent = pct + "%";
   document.getElementById("zipFill").style.width = pct + "%";
+}
+
+function renderPlaylistStatus(status) {
+  document.getElementById("playlistBar").classList.toggle("visible", !!status);
+  document.getElementById("playlistBtn").classList.toggle("active", !!status);
+  if (!status) return;
+  const pct = Math.round((status.done / status.total) * 100);
+  document.getElementById("playlistLabel").textContent = `Playlist — ${status.done}/${status.total} pages · ${status.found} media`;
+  document.getElementById("playlistPct").textContent = pct + "%";
+  document.getElementById("playlistFill").style.width = pct + "%";
+  // Dev builds only: every page crawled, with its state.
+  const debug = document.getElementById("playlistDebug");
+  debug.hidden = !status.pages;
+  if (status.pages) {
+    debug.innerHTML = status.pages.map((p) =>
+      `<div class="pl-${escapeHtml(p.state.split(":")[0])}" title="${escapeHtml(p.url)}">` +
+      `<b>${escapeHtml(p.state)}${p.state === "done" ? " · " + p.found : ""}${p.secs != null ? " · " + p.secs + "s" : ""}</b> ${escapeHtml(p.url)}</div>` +
+      (p.errors || []).map((e) => `<div class="pl-err" title="${escapeHtml(e)}">&nbsp;&nbsp;\u26a0 ${escapeHtml(e)}</div>`).join("")).join("");
+  }
 }
 
 function updateQueueBar(queueLength, active) {
@@ -673,6 +768,7 @@ function renderMediaItem(container, media) {
         ${resHtml}
         ${streamBadge}
         ${sourceHtml}
+        ${media.playlistPage ? `<span title="${escapeHtml(media.playlistPage)}">\u2630 ${escapeHtml((media.playlistTitle || media.playlistPage).slice(0, 40))}</span>` : ""}
         ${dupeHtml}
         <span>${escapeHtml(media.domain)}</span>
         ${sizeHtml}
@@ -985,7 +1081,8 @@ function exportMedia(format) {
       quality: m.quality || null,
       source: m.source || null,
       resolution: m.resolution || null,
-      duration: m.duration ? formatDuration(m.duration) : null
+      duration: m.duration ? formatDuration(m.duration) : null,
+      page: m.playlistPage || null
     }));
     const content = JSON.stringify(data, null, 2);
     downloadAsFile(content, "media-data.json", "application/json");
@@ -994,16 +1091,12 @@ function exportMedia(format) {
   }
 }
 
+// Saved by the background: a blob: URL made here dies with the popup, which
+// closes as soon as the "Save as" dialog takes the focus.
 function downloadAsFile(content, filename, mimeType) {
-  const blob = new Blob([content], { type: mimeType });
-  const url = URL.createObjectURL(blob);
-  // An export lists the URLs seen in the tab, so in a private window it belongs
-  // to the private download session like any other download.
-  const opts = { url, filename };
-  if (isPrivateContext) opts.incognito = true;
-  browser.downloads.download(opts).then(() => {
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
-  });
+  send({ action: "export_file", content, filename, mimeType })
+    .then((resp) => { if (resp && resp.error) showToast("Export failed: " + resp.error); })
+    .catch((err) => showToast("Export failed: " + err.message));
 }
 
 // ── Download ──
@@ -1022,7 +1115,7 @@ function toggleDownload(media) {
 function cancelDownload(url) {
   downloadStates[url] = { state: "cancelling", progress: 0 };
   renderDownloadState(url);
-  browser.runtime.sendMessage({ action: "cancel_download", url }).catch(() => {});
+  send({ action: "cancel_download", url }).catch(() => {});
 }
 
 // "12:34 / 45:00 captured" — how much of the video the player has fed so far.
@@ -1045,7 +1138,7 @@ function downloadMedia(media) {
   downloadStates[media.url] = { state: "queued", progress: 0 };
   renderDownloadState(media.url);
 
-  browser.runtime.sendMessage({
+  send({
     action: "download",
     url: media.url,
     filename: media.filename,
@@ -1120,7 +1213,7 @@ function downloadBatch(items, renamePattern = null) {
   if (items.length === 0) return;
   if (items.length === 1 && !renamePattern) { downloadMedia(items[0]); return; }
 
-  browser.runtime.sendMessage({
+  send({
     action: "batch_download",
     items: items.map((m) => ({ url: m.url, filename: m.filename, quality: m.quality, domain: m.domain })),
     renamePattern,
@@ -1147,7 +1240,7 @@ function applyDefaultSort() {
 
 function trackDownload(url, downloadId) {
   const interval = setInterval(() => {
-    browser.runtime.sendMessage({ action: "download_progress", downloadId }).catch(() => null).then((resp) => {
+    send({ action: "download_progress", downloadId }).catch(() => null).then((resp) => {
       if (!resp) { clearInterval(interval); return; }
       if (resp.state === "complete") {
         downloadStates[url] = { state: "done", progress: 100 };

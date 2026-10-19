@@ -33,6 +33,17 @@ const tabWatchMode = {};
 const tabPrivate = {};
 // Page URL per tab, used as the Referer of our own media requests
 const tabPageUrl = {};
+// The page (or frame) that requested each media URL. A player embedded from
+// another site, or a page loaded by playlist mode, is not the tab's page, and
+// CDNs answer 403 when the Referer is not the page that played the video.
+// ponytail: in memory only, capped; after an unload tabPageUrl is the fallback.
+const mediaPage = new Map();
+
+function rememberMediaPage(url, page) {
+  if (!page || page.startsWith("moz-extension:") || mediaPage.has(url)) return;
+  if (mediaPage.size >= 5000) mediaPage.delete(mediaPage.keys().next().value);
+  mediaPage.set(url, page);
+}
 // Download queue
 const downloadQueue = [];
 // Downloads the user asked to stop, keyed by the URL the popup shows
@@ -68,7 +79,8 @@ let maxConcurrentDownloads = 2;
 let keepAliveTimer = null;
 
 function updateKeepAlive() {
-  const busy = activeDownloads > 0 || downloadQueue.length > 0 || blobUrls.size > 0;
+  const busy = activeDownloads > 0 || downloadQueue.length > 0 || blobUrls.size > 0 ||
+    Object.keys(playlistJobs).length > 0;
   if (busy && !keepAliveTimer) keepAliveTimer = setInterval(() => browser.runtime.getPlatformInfo(), 20000);
   if (!busy && keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; }
 }
@@ -327,6 +339,7 @@ browser.webRequest.onBeforeSendHeaders.addListener(
       (h) => !/^(referer|origin)$/i.test(h.name)
     );
     headers.push({ name: "Referer", value: wanted.referer });
+    if (wanted.once) pendingRequestHeaders.delete(details.url);
     if (wanted.origin) headers.push({ name: "Origin", value: wanted.origin });
     return { requestHeaders: headers };
   },
@@ -335,8 +348,9 @@ browser.webRequest.onBeforeSendHeaders.addListener(
 );
 
 // Everything the background page needs to reproduce a tab's request context.
-function tabContext(tabId) {
-  return { isPrivate: isPrivateTab(tabId), referer: tabPageUrl[tabId] || null };
+// With the media URL, the Referer is the page that requested that media.
+function tabContext(tabId, url) {
+  return { isPrivate: isPrivateTab(tabId), referer: (url && mediaPage.get(url)) || tabPageUrl[tabId] || null };
 }
 
 // Requests made on behalf of a private tab are sent without credentials so the
@@ -1093,7 +1107,7 @@ function transmuxTStoMP4(tsData) {
 // manifest URL whenever a consolidated stream is downloaded through its
 // manifest, and reporting on the wrong key leaves the popup without a bar.
 async function downloadStream(tabId, url, filename, qualityHeight, progressKey = url, sink = null) {
-  const ctx = tabContext(tabId);
+  const ctx = tabContext(tabId, url);
 
   const capturedSegments = collectCapturedSegments(tabId, url);
 
@@ -2503,7 +2517,7 @@ async function downloadConsolidatedStream(tabId, streamKey, filename, sink = nul
     return { error: "No segments captured. Play the video first." };
   }
 
-  const ctx = tabContext(tabId);
+  const ctx = tabContext(tabId, segmentUrls[0].url);
   const video = await downloadSegmentsWithProgress(
     segmentUrls, progressKey, 0, segmentUrls.length, ctx
   );
@@ -2546,6 +2560,177 @@ function clearTabMedia(tabId) {
   delete hiddenAds[tabId];
   delete tabUsesMediaSource[tabId];
   updateBadge(tabId);
+}
+
+// ── Playlist mode ──
+// On demand only: the same-site links of the page are opened one by one in
+// muted background tabs, the usual detection (DOM scan + network) runs in
+// each, and what it found is moved into the tab the user started from.
+
+const PLAYLIST_MAX_PAGES = 40;
+const PLAYLIST_PARALLEL = 3;
+// A page is kept open after its load until its network has been quiet for a
+// while: players fetch their manifests and segments well after "complete".
+const PLAYLIST_MIN_DWELL_MS = 6000;  // lazy players, MutationObserver scans
+const PLAYLIST_QUIET_MS = 4000;
+const PLAYLIST_MAX_DWELL_MS = 45000;
+const PLAYLIST_PAGE_TIMEOUT_MS = 25000;
+// helper tabId -> { last: time of the last request seen, errors: [] }
+const helperNet = {};
+
+function trackHelperRequest(details) {
+  const net = helperNet[details.tabId];
+  if (!net) return;
+  net.last = Date.now();
+  const failed = details.error
+    ? !/NS_BINDING_ABORTED/.test(details.error) && details.error
+    : details.statusCode >= 400 && "HTTP " + details.statusCode;
+  // Pictures, fonts and trackers failing say nothing about the videos.
+  if (failed && !/^(image|imageset|font|beacon|ping|csp_report)$/.test(details.type) && net.errors.length < 20) net.errors.push(`${failed} ${details.type} ${details.url}`);
+}
+browser.webRequest.onBeforeRequest.addListener(trackHelperRequest, { urls: ["<all_urls>"] });
+browser.webRequest.onCompleted.addListener(trackHelperRequest, { urls: ["<all_urls>"] });
+browser.webRequest.onErrorOccurred.addListener(trackHelperRequest, { urls: ["<all_urls>"] });
+// parentTabId -> { total, done, found, stop, helpers: Set<tabId>, pages }
+const playlistJobs = {};
+// Dev build (./build.sh dev): the popup lists every page crawled and its state.
+const PLAYLIST_DEBUG = browser.runtime.getManifest().name.endsWith(" DEV");
+
+function playlistStatus(tabId) {
+  const job = playlistJobs[tabId];
+  if (!job) return null;
+  return { total: job.total, done: job.done, found: job.found, pages: PLAYLIST_DEBUG ? job.pages : undefined };
+}
+
+function notifyPlaylist(tabId) {
+  browser.runtime.sendMessage({ action: "playlist_progress", tabId, status: playlistStatus(tabId) }).catch(() => {});
+}
+
+// Moves what a helper tab detected into the parent. MSE captures stay
+// behind: they live in IndexedDB under the helper tab and need playback.
+function adoptHelperMedia(parentId, helperId, pageUrl) {
+  const pageTitle = tabTitles[helperId] || pageUrl;
+  let added = 0;
+  if (!tabMedia[parentId]) tabMedia[parentId] = new Map();
+  for (const [key, m] of tabMedia[helperId] || []) {
+    if (m.type === "image" || m.isMseCapture || tabMedia[parentId].has(key)) continue;
+    // Every page of a site tends to serve the same file name (master.m3u8,
+    // video.mp4): without the page in the fingerprint the popup would merge
+    // all of them into one item, and the downloads would share a name.
+    const prefix = pageTitle.replace(/[\\/:*?"<>|]+/g, "_").trim().slice(0, 60);
+    tabMedia[parentId].set(key, {
+      ...m, playlistPage: pageUrl, playlistTitle: pageTitle,
+      filename: prefix ? `${prefix} - ${m.filename}` : m.filename,
+      fingerprint: pageUrl + "|" + (m.fingerprint || key),
+      groupHash: m.groupHash && pageUrl + "|" + m.groupHash
+    });
+    added++;
+  }
+  for (const store of [tabStreams, tabHLS]) {
+    if (!store[helperId]) continue;
+    const target = store[parentId] || (store[parentId] = new Map());
+    for (const [k, v] of store[helperId]) if (!target.has(k)) target.set(k, v);
+  }
+  updateBadge(parentId);
+  persistSoon();
+  return added;
+}
+
+function waitForTabLoad(tabId) {
+  return new Promise((resolve) => {
+    const done = () => {
+      browser.tabs.onUpdated.removeListener(onUpdated);
+      browser.tabs.onRemoved.removeListener(onRemoved);
+      clearTimeout(timer);
+      resolve();
+    };
+    // A new tab first reports about:blank as complete, before the page starts.
+    const onUpdated = (id, info, tab) => {
+      if (id === tabId && info.status === "complete" && tab.url !== "about:blank") done();
+    };
+    const onRemoved = (id) => { if (id === tabId) done(); };
+    const timer = setTimeout(done, PLAYLIST_PAGE_TIMEOUT_MS);
+    browser.tabs.onUpdated.addListener(onUpdated);
+    browser.tabs.onRemoved.addListener(onRemoved);
+  });
+}
+
+async function crawlPlaylistPage(parentTab, job, url) {
+  const page = job.pages.find((p) => p.url === url);
+  const t0 = Date.now();
+  const setPage = (state, found) => {
+    page.state = state;
+    page.secs = Math.round((Date.now() - t0) / 1000);
+    if (found !== undefined) page.found = found;
+    if (PLAYLIST_DEBUG) console.log("[playlist]", state, found ?? "", page.secs + "s", url, page.errors || "");
+    notifyPlaylist(parentTab.id);
+  };
+  setPage("loading");
+  // The window already picks the private cookie store; naming a store
+  // (private or a container) needs the "cookies" permission, so it is only
+  // tried for containers and dropped when refused.
+  const props = { url, active: false, windowId: parentTab.windowId, index: parentTab.index + 1 };
+  const store = parentTab.cookieStoreId;
+  let helper;
+  try {
+    helper = await browser.tabs.create(store && store !== "firefox-default" && !parentTab.incognito
+      ? { ...props, cookieStoreId: store } : props)
+      .catch(() => browser.tabs.create(props));
+  } catch (e) { setPage("error: " + e.message); return; }
+  job.helpers.add(helper.id);
+  const net = helperNet[helper.id] = { last: Date.now(), errors: [] };
+  page.errors = net.errors;
+  browser.tabs.update(helper.id, { muted: true }).catch(() => {});
+  await waitForTabLoad(helper.id);
+  if (!job.stop) {
+    setPage("scanning");
+    const loaded = Date.now();
+    while (!job.stop) {
+      await new Promise((r) => setTimeout(r, 500));
+      const now = Date.now();
+      if (now - loaded >= PLAYLIST_MAX_DWELL_MS) { net.errors.push("still busy after " + PLAYLIST_MAX_DWELL_MS / 1000 + "s"); break; }
+      if (now - loaded >= PLAYLIST_MIN_DWELL_MS && now - net.last >= PLAYLIST_QUIET_MS) break;
+    }
+  }
+  delete helperNet[helper.id];
+  if (!job.stop) {
+    const added = adoptHelperMedia(parentTab.id, helper.id, url);
+    job.found += added;
+    setPage("done", added);
+  } else setPage("stopped");
+  job.helpers.delete(helper.id);
+  await browser.tabs.remove(helper.id).catch(() => {});
+}
+
+async function runPlaylist(parentTab, urls) {
+  const job = playlistJobs[parentTab.id] = {
+    total: urls.length, done: 0, found: 0, stop: false, helpers: new Set(),
+    pages: urls.map((url) => ({ url, state: "pending", found: 0 }))
+  };
+  if (PLAYLIST_DEBUG) console.log("[playlist] links found:", urls);
+  updateKeepAlive();
+  notifyPlaylist(parentTab.id);
+  const queue = [...urls];
+  const worker = async () => {
+    while (queue.length && !job.stop) {
+      await crawlPlaylistPage(parentTab, job, queue.shift());
+      job.done++;
+      notifyPlaylist(parentTab.id);
+      // The popup refreshes its list on this message.
+      browser.runtime.sendMessage({ action: "new_media" }).catch(() => {});
+    }
+  };
+  await Promise.all(Array.from({ length: PLAYLIST_PARALLEL }, worker));
+  delete playlistJobs[parentTab.id];
+  updateKeepAlive();
+  browser.runtime.sendMessage({ action: "playlist_done", tabId: parentTab.id, found: job.found, cancelled: job.stop }).catch(() => {});
+}
+
+function stopPlaylist(tabId) {
+  const job = playlistJobs[tabId];
+  if (!job) return;
+  job.stop = true;
+  for (const id of job.helpers) browser.tabs.remove(id).catch(() => {});
 }
 
 // ── MSE capture store ──
@@ -2863,7 +3048,7 @@ async function fetchForZip(url, tabId) {
     if (!inflight.has(url)) inflight.set(url, new Set());
     inflight.get(url).add(ac);
     try {
-      const resp = await mediaFetch(url, { ...tabContext(tabId), withCookies: true }, null,
+      const resp = await mediaFetch(url, { ...tabContext(tabId, url), withCookies: true }, null,
         AbortSignal.any([ac.signal, AbortSignal.timeout(ZIP_FILE_TIMEOUT_MS)]));
       if ((resp.status === 429 || resp.status === 503) && attempt < ZIP_ATTEMPTS) {
         const retryAfter = parseInt(resp.headers.get("Retry-After"), 10);
@@ -3070,7 +3255,14 @@ async function executeDownload(item) {
   }
 
   // Regular download — the browser owns the transfer from here, so the popup
-  // follows it by download id instead of waiting on us.
+  // follows it by download id instead of waiting on us. Its first request
+  // gets the Referer like ours do (downloads.download cannot set it).
+  const { referer } = tabContext(tabId, url);
+  if (referer) {
+    let origin = null;
+    try { origin = new URL(referer).origin; } catch {}
+    pendingRequestHeaders.set(url, { referer, origin, count: 1, once: true });
+  }
   const dlId = await startDownload({ url, filename }, tabId);
   browserDownloads.set(url, dlId);
   // The duplicate log is shared across tabs and outlives the private window,
@@ -3124,6 +3316,7 @@ browser.webRequest.onHeadersReceived.addListener(
     const segmentLike = isSegment(url, contentType, fileSize);
 
     if (segmentLike) {
+      rememberMediaPage(url, pageUrl);
       addSegmentToStream(details.tabId, { url, size: fileSize, contentType });
       return;
     }
@@ -3132,6 +3325,7 @@ browser.webRequest.onHeadersReceived.addListener(
     if (MEDIA_EXTENSIONS.test(url)) isMedia = true;
     if (contentType && MEDIA_CONTENT_TYPES.test(contentType)) {
       if (fileSize && fileSize < 500000 && !MEDIA_EXTENSIONS.test(url)) {
+        rememberMediaPage(url, pageUrl);
         addSegmentToStream(details.tabId, { url, size: fileSize, contentType });
         return;
       }
@@ -3139,6 +3333,7 @@ browser.webRequest.onHeadersReceived.addListener(
     }
 
     if (isMedia) {
+      rememberMediaPage(url, pageUrl);
       const isM3U8 = /\.m3u8(\?|$)/i.test(url);
       const isMPD = /\.mpd(\?|$)/i.test(url);
 
@@ -3147,7 +3342,7 @@ browser.webRequest.onHeadersReceived.addListener(
       // no such distinction: it is always the whole description, and a few
       // kilobytes is its normal size.
       if (isM3U8 && fileSize && fileSize < 50000) {
-        parseM3U8(url, tabContext(details.tabId)).then((parsed) => {
+        parseM3U8(url, tabContext(details.tabId, url)).then((parsed) => {
           if (!parsed || stale()) return;
           linkManifestToStreams(details.tabId, url, parsed);
         }).catch(() => {});
@@ -3157,7 +3352,7 @@ browser.webRequest.onHeadersReceived.addListener(
       if (/auth|token|drm|license|widevine|playready/i.test(url)) return;
 
       if (isMPD) {
-        parseMPD(url, tabContext(details.tabId)).then((parsed) => {
+        parseMPD(url, tabContext(details.tabId, url)).then((parsed) => {
           if (!parsed || stale()) return;
 
           const qualities = parsed.video.map((t) => t.height).filter(Boolean).sort((a, b) => b - a);
@@ -3179,7 +3374,7 @@ browser.webRequest.onHeadersReceived.addListener(
       }
 
       if (isM3U8) {
-        parseM3U8(url, tabContext(details.tabId)).then((parsed) => {
+        parseM3U8(url, tabContext(details.tabId, url)).then((parsed) => {
           if (!parsed || stale()) return;
 
           linkManifestToStreams(details.tabId, url, parsed);
@@ -3239,6 +3434,7 @@ browser.webRequest.onHeadersReceived.addListener(
 
 browser.tabs.onRemoved.addListener((tabId) => {
   persistSoon();
+  stopPlaylist(tabId);
   tabGen[tabId] = (tabGen[tabId] || 0) + 1;
   mseDropTab(tabId);
   delete tabMedia[tabId];
@@ -3265,6 +3461,13 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
 // ── Message handling ──
 
+// The tab a popup message is about: the popup's own tab when it was detached
+// into a window (popup.html?tab=N), else the active tab.
+function targetTabs(message) {
+  if (message.tabId) return browser.tabs.get(message.tabId).then((t) => [t], () => []);
+  return browser.tabs.query({ active: true, currentWindow: true });
+}
+
 browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action !== "mse_chunk" && message.action !== "get_media") persistSoon();
   // Content script found media
@@ -3273,6 +3476,8 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (sender.tab) markTabPrivacy(sender.tab.id, sender.tab.incognito);
     if (tabId && message.links) {
       message.links.forEach((link) => {
+        // The frame that listed it: an embedded player from another site.
+        rememberMediaPage(link.url, sender.url);
         const mediaInfo = { ...link, source: link.source || "dom" };
         // Attach resolution/duration from content script if available
         if (link.resolution) mediaInfo.resolution = link.resolution;
@@ -3309,7 +3514,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // Popup requests media list
   if (message.action === "get_media") {
-    stateReady.then(() => browser.tabs.query({ active: true, currentWindow: true })).then((tabs) => {
+    stateReady.then(() => targetTabs(message)).then((tabs) => {
       if (tabs[0]) {
         const tabId = tabs[0].id;
         markTabPrivacy(tabId, tabs[0].incognito);
@@ -3379,7 +3584,8 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
           watchMode: !!tabWatchMode[tabId],
           queueLength: downloadQueue.length,
           activeDownloads,
-          zipStatus
+          zipStatus,
+          playlist: playlistStatus(tabId)
         });
       } else {
         sendResponse({ media: [], pageTitle: "", streams: [], isPrivate: false, adsHidden: 0, usesMediaSource: false, watchMode: false, queueLength: 0, activeDownloads: 0 });
@@ -3390,7 +3596,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // Clear everything detected in this tab
   if (message.action === "clear_media") {
-    browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => {
+    targetTabs(message).then((tabs) => {
       if (!tabs[0]) { sendResponse({ cleared: false }); return; }
       clearTabMedia(tabs[0].id);
       browser.tabs.sendMessage(tabs[0].id, { action: "forget" }).catch(() => {});
@@ -3429,16 +3635,47 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // Rescan
   if (message.action === "rescan") {
-    browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => {
+    targetTabs(message).then((tabs) => {
       // No content script on about:, the PDF viewer or addons.mozilla.org.
       if (tabs[0]) browser.tabs.sendMessage(tabs[0].id, { action: "rescan" }).catch(() => {});
     });
     return;
   }
 
+  // Playlist mode: crawl the same-site links of the page
+  if (message.action === "playlist_start") {
+    targetTabs(message).then(async (tabs) => {
+      const tab = tabs[0];
+      if (!tab || playlistJobs[tab.id]) { sendResponse({ error: tab ? "Already running" : "No tab" }); return; }
+      let urls = [];
+      try { urls = await browser.tabs.sendMessage(tab.id, { action: "get_same_site_links", basePath: message.basePath || null }, { frameId: 0 }); } catch {}
+      urls = (urls || []).slice(0, PLAYLIST_MAX_PAGES);
+      sendResponse({ count: urls.length });
+      if (urls.length) runPlaylist(tab, urls);
+    }).catch(() => sendResponse({ error: "No tab" }));
+    return true;
+  }
+
+  if (message.action === "playlist_stop") {
+    targetTabs(message).then((tabs) => {
+      if (tabs[0]) stopPlaylist(tabs[0].id);
+    });
+    return;
+  }
+
+  // Export from the popup. An export lists the URLs seen in the tab, so in a
+  // private window it goes to the private download session (startDownload).
+  if (message.action === "export_file") {
+    targetTabs(message).then((tabs) => {
+      const url = URL.createObjectURL(new Blob([message.content], { type: message.mimeType }));
+      return startDownload({ url, filename: message.filename }, tabs[0]?.id);
+    }).then(() => sendResponse({ ok: true }), (err) => sendResponse({ error: err.message }));
+    return true;
+  }
+
   // Toggle watch mode
   if (message.action === "toggle_watch") {
-    browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => {
+    targetTabs(message).then((tabs) => {
       if (tabs[0]) {
         const tabId = tabs[0].id;
         tabWatchMode[tabId] = !tabWatchMode[tabId];
@@ -3462,7 +3699,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "batch_download") {
     browser.storage.local.get("options").then(async (result) => {
       const options = result.options || {};
-      const tabId = message.tabId || (await browser.tabs.query({ active: true, currentWindow: true }))[0]?.id;
+      const tabId = message.tabId || (await targetTabs(message))[0]?.id;
       const ptitle = tabTitles[tabId] || message.pageTitle || "";
       maxConcurrentDownloads = options.maxConcurrent || 2;
 

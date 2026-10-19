@@ -436,7 +436,30 @@
 
   runScan();
 
+  // Playlist mode: the pages of this site the page links to. Files, and
+  // links that would change the session (logout, delete...), are left out:
+  // each one is opened in a background tab.
+  const SKIP_LINK = /\.(jpe?g|png|gif|webp|svg|pdf|zip|rar|7z|exe|dmg|mp4|webm|mkv|m3u8|mpd|mp3|m4a)(\?|$)|log_?out|sign_?out|logoff|delete|remove|unsubscribe/i;
+  const siteOf = (host) => host.replace(/^www\./, "");
+
+  // base: only the pages under that path, "/test/a/" -> /test/a/*
+  function sameSiteLinks(base) {
+    const here = location.href.split("#")[0];
+    const urls = new Set();
+    for (const a of document.querySelectorAll("a[href]")) {
+      let u;
+      try { u = new URL(a.href, location.href); } catch { continue; }
+      if (!/^https?:$/.test(u.protocol) || siteOf(u.hostname) !== siteOf(location.hostname)) continue;
+      if (a.hasAttribute("download") || SKIP_LINK.test(u.pathname + u.search)) continue;
+      if (base && !u.pathname.startsWith(base)) continue;
+      u.hash = "";
+      if (u.href !== here) urls.add(u.href);
+    }
+    return [...urls];
+  }
+
   browser.runtime.onMessage.addListener((message) => {
+    if (message.action === "get_same_site_links") return Promise.resolve(sameSiteLinks(message.basePath));
     if (message.action === "rescan" || message.action === "forget") {
       lastFoundUrls.clear();
       if (message.action === "rescan") runScan();
