@@ -1310,7 +1310,7 @@ function updateRenamePreview() {
       .replace(/\{quality\}/gi, q)
       .replace(/\{index\}/gi, padded)
       .replace(/\{ext\}/gi, ext)
-      + ext;
+      + (/\{ext\}/i.test(pattern) ? "" : ext);
   });
 
   preview.innerHTML = samples.map((s) => escapeHtml(s)).join("<br>");

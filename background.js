@@ -499,7 +499,8 @@ function applyBatchRename(media, pageTitle, pattern, index, total) {
     .replace(/\{quality\}/gi, quality)
     .replace(/\{index\}/gi, padded)
     .replace(/\{ext\}/gi, ext)
-    + ext;
+    // A pattern that places {ext} itself already carries the extension.
+    + (/\{ext\}/i.test(pattern) ? "" : ext);
 }
 
 // ── Segment detection & stream grouping ──
